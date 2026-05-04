@@ -2,7 +2,20 @@
 #
 # amnezia-installer.sh — AmneziaWG road-warrior VPN server installer for Linux.
 #
-# Subcommands:
+# ─── Quick install ──────────────────────────────────────────────────────────
+#   # One-liner, non-interactive (takes all defaults; override with AMNEZIA_* env):
+#   curl -fsSL https://raw.githubusercontent.com/maciekish/amnezia-installer/main/amnezia-installer.sh | sudo bash
+#
+#   # Interactive (preserves the TTY so prompts work):
+#   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/maciekish/amnezia-installer/main/amnezia-installer.sh)"
+#
+#   # Or: download once, then run with any subcommand:
+#   curl -fsSL https://raw.githubusercontent.com/maciekish/amnezia-installer/main/amnezia-installer.sh -o amnezia-installer.sh
+#   chmod +x amnezia-installer.sh && sudo ./amnezia-installer.sh
+#
+# The URLs above always resolve to the latest version on the `main` branch.
+#
+# ─── Subcommands ────────────────────────────────────────────────────────────
 #   install                 Interactive install (default if no subcommand given)
 #   add-client    <name>    Generate a new peer + client config
 #   remove-client <name>    Revoke a peer
@@ -977,6 +990,13 @@ EOF
 usage() {
     cat <<EOF
 ${SCRIPT_NAME} v${SCRIPT_VERSION}
+
+Quick install (always pulls the latest from the main branch):
+  # Non-interactive one-liner (all defaults; override with AMNEZIA_* env):
+  curl -fsSL https://raw.githubusercontent.com/maciekish/amnezia-installer/main/amnezia-installer.sh | sudo bash
+
+  # Interactive (keeps the TTY so prompts work):
+  sudo bash -c "\$(curl -fsSL https://raw.githubusercontent.com/maciekish/amnezia-installer/main/amnezia-installer.sh)"
 
 Usage:
   sudo $0 [install]                  # interactive install (default)
