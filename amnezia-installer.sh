@@ -50,6 +50,15 @@
 #   AMNEZIA_NET6=fd86:ea04:1115::/64
 #   AMNEZIA_DNS="1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001"
 #   AMNEZIA_MTU=1280
+#   AMNEZIA_NO_UPDATE_CHECK=1    skip the on-startup self-update check
+#   AMNEZIA_FORCE_CLEANUP=1      auto-clean any existing AmneziaWG install before reinstalling
+#
+# Self-update: on every invocation the script compares its own SCRIPT_VERSION
+# tag against the version found at the URL above; if newer it downloads,
+# verifies syntax, replaces /var/lib/amnezia-installer/amnezia-installer.sh,
+# and re-execs. Only the AmneziaWG installation is ever touched on cleanup —
+# stock WireGuard interfaces (wg*), /etc/wireguard/, wg-quick@*.service, and
+# any third-party VPN are left strictly alone.
 #
 # This script is intentionally bash-only (#!/usr/bin/env bash) so it runs identically whether
 # the invoking user's login shell is bash or zsh.
@@ -59,7 +68,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly SCRIPT_NAME="amnezia-installer"
 readonly IFACE="awg0"
 readonly SVC="awg-quick@${IFACE}.service"
@@ -68,12 +77,17 @@ readonly AWG_CONF="${AWG_DIR}/${IFACE}.conf"
 readonly STATE_DIR="/var/lib/${SCRIPT_NAME}"
 readonly CLIENTS_DIR="${STATE_DIR}/clients"
 readonly META_FILE="${STATE_DIR}/server.env"
+readonly INSTALLED_SELF="${STATE_DIR}/${SCRIPT_NAME}.sh"
+readonly UPDATE_STAMP="${STATE_DIR}/.last-update-check"
+readonly SYMLINK="/usr/local/bin/${SCRIPT_NAME}"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-${SCRIPT_NAME}.conf"
 readonly HOOK_UP="${AWG_DIR}/${IFACE}.up.sh"
 readonly HOOK_DOWN="${AWG_DIR}/${IFACE}.down.sh"
 readonly NFT_T_FWD="amnezia_fwd"
 readonly NFT_T_NAT4="amnezia_nat4"
 readonly NFT_T_NAT6="amnezia_nat6"
+readonly UPDATE_URL="https://raw.githubusercontent.com/maciekish/amnezia-installer/main/amnezia-installer.sh"
+readonly UPDATE_CACHE_SECONDS=86400  # only hit the network once a day
 
 # ---------------------------------------------------------------------------
 # Logging / UX helpers
@@ -225,6 +239,214 @@ suggest_port() {
         if ! is_port_in_use "$p"; then printf '%s' "$p"; return; fi
     done
     printf '%s' 51820
+}
+
+# ---------------------------------------------------------------------------
+# Self-update: compare the local SCRIPT_VERSION tag against the head of the
+# canonical script on `main`, and re-exec ourselves on a new version. We never
+# touch anything other than $INSTALLED_SELF, and a syntax check runs on the
+# downloaded copy before we trust it.
+# ---------------------------------------------------------------------------
+version_gt() {
+    # version_gt A B -> true if A > B (semver-ish, falls back to string compare)
+    [ "$1" = "$2" ] && return 1
+    local newer
+    newer=$(printf '%s\n%s\n' "$1" "$2" | sort -V 2>/dev/null | tail -n1)
+    [ "$newer" = "$1" ]
+}
+
+remote_version() {
+    # Echoes the SCRIPT_VERSION found in the remote script (or empty on failure).
+    curl -fsSL --max-time 6 "$UPDATE_URL" 2>/dev/null \
+        | grep -m1 -E '^readonly[[:space:]]+SCRIPT_VERSION=' \
+        | sed -E 's/.*"([^"]+)".*/\1/' \
+        || true
+}
+
+update_check_cached() {
+    # Returns 0 if we already checked within UPDATE_CACHE_SECONDS.
+    [ -r "$UPDATE_STAMP" ] || return 1
+    local now stamp
+    now=$(date +%s)
+    stamp=$(cat "$UPDATE_STAMP" 2>/dev/null || echo 0)
+    [ -n "$stamp" ] && [ "$((now - stamp))" -lt "$UPDATE_CACHE_SECONDS" ]
+}
+
+stamp_update_check() {
+    [ -d "$STATE_DIR" ] || return 0
+    date +%s >"$UPDATE_STAMP" 2>/dev/null || true
+}
+
+self_update() {
+    # self_update [--force] [originally-passed-args...]
+    local force=0
+    if [ "${1:-}" = "--force" ]; then force=1; shift; fi
+
+    [ "${AMNEZIA_NO_UPDATE_CHECK:-0}" = "1" ] && return 0
+    [ "${_AMNEZIA_UPDATED:-0}" = "1" ] && return 0          # already re-execed
+    [ "$force" -eq 1 ] || ! update_check_cached || return 0  # cache hit
+
+    command -v curl >/dev/null 2>&1 || return 0
+
+    local rv
+    rv=$(remote_version)
+    stamp_update_check
+    [ -n "$rv" ] || return 0
+
+    if ! version_gt "$rv" "$SCRIPT_VERSION"; then
+        return 0
+    fi
+
+    info "amnezia-installer update available: $SCRIPT_VERSION -> $rv"
+    if [ "$force" -ne 1 ] && [ "${AMNEZIA_NONINTERACTIVE:-0}" != "1" ]; then
+        if ! ask_yn "Update now and re-run?" "y"; then
+            info "Update skipped. Use 'self-update --force' or unset AMNEZIA_NONINTERACTIVE later."
+            return 0
+        fi
+    fi
+
+    local tmp; tmp=$(mktemp)
+    if ! curl -fsSL --max-time 30 "$UPDATE_URL" -o "$tmp"; then
+        warn "Could not download update; continuing with $SCRIPT_VERSION."
+        rm -f "$tmp"; return 0
+    fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        warn "Downloaded update failed syntax check; ignoring."
+        rm -f "$tmp"; return 0
+    fi
+    install -d -m 0755 "$STATE_DIR"
+    install -m 0755 "$tmp" "$INSTALLED_SELF"
+    ln -sf "$INSTALLED_SELF" "$SYMLINK" 2>/dev/null || true
+    rm -f "$tmp"
+    log "Updated to $rv. Re-executing..."
+    export _AMNEZIA_UPDATED=1
+    exec "$INSTALLED_SELF" "$@"
+}
+
+install_self_to_state() {
+    # Drop the running script (or, if invoked via curl|bash where $0 isn't a
+    # real file, the latest from $UPDATE_URL) into $INSTALLED_SELF and link it
+    # onto $PATH so the user can call `amnezia-installer ...` directly.
+    install -d -m 0755 "$STATE_DIR"
+    if [ -f "$0" ] && [ -r "$0" ] && [ "$(realpath -m "$0" 2>/dev/null)" != "$INSTALLED_SELF" ]; then
+        install -m 0755 "$0" "$INSTALLED_SELF"
+    elif [ ! -f "$INSTALLED_SELF" ]; then
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fsSL --max-time 30 "$UPDATE_URL" -o "$INSTALLED_SELF"; then
+                chmod 0755 "$INSTALLED_SELF"
+            else
+                warn "Could not stage script copy at $INSTALLED_SELF."
+                rm -f "$INSTALLED_SELF"
+            fi
+        fi
+    fi
+    if [ -f "$INSTALLED_SELF" ]; then
+        ln -sf "$INSTALLED_SELF" "$SYMLINK" 2>/dev/null || true
+        info "Installed script copy: $INSTALLED_SELF (symlinked at $SYMLINK)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Existing-install detection — finds AmneziaWG leftovers (active service,
+# stale config, dangling interface, our nft tables, our sysctl drop-in, our
+# state dir) and offers a *scoped* cleanup. Stock WireGuard interfaces and any
+# unrelated VPN are NEVER touched: the matching is exact (awg0, awg-quick@awg0,
+# /etc/amnezia/amneziawg/, amnezia_* nft tables, our sysctl filename).
+# ---------------------------------------------------------------------------
+detect_existing_awg() {
+    # Echoes one finding per line; empty output == nothing found.
+    local found=()
+
+    if systemctl list-unit-files "$SVC" 2>/dev/null | grep -q "$SVC"; then
+        local state
+        state=$(systemctl is-active "$SVC" 2>/dev/null || true)
+        case "$state" in
+            active)         found+=("service '$SVC' is active") ;;
+            failed)         found+=("service '$SVC' is in FAILED state") ;;
+            activating)     found+=("service '$SVC' is starting") ;;
+            inactive|"")    : ;;
+            *)              found+=("service '$SVC' present (state: $state)") ;;
+        esac
+        if [ "$(systemctl is-enabled "$SVC" 2>/dev/null || true)" = "enabled" ]; then
+            found+=("service '$SVC' is enabled at boot")
+        fi
+    fi
+
+    [ -e "$AWG_CONF" ]                   && found+=("config file $AWG_CONF")
+    [ -e "$HOOK_UP" ] || [ -e "$HOOK_DOWN" ] && found+=("hook scripts in $AWG_DIR")
+    ip link show "$IFACE" >/dev/null 2>&1 && found+=("interface '$IFACE' is up")
+    [ -e "$SYSCTL_FILE" ]                && found+=("sysctl drop-in $SYSCTL_FILE")
+    [ -e "$META_FILE" ]                  && found+=("state file $META_FILE")
+
+    local t
+    for t in "$NFT_T_FWD" "$NFT_T_NAT4" "$NFT_T_NAT6"; do
+        if nft list tables 2>/dev/null | grep -qE "table (inet|ip|ip6) ${t}\$"; then
+            found+=("nftables table $t")
+        fi
+    done
+
+    if [ "${#found[@]}" -gt 0 ]; then
+        printf '%s\n' "${found[@]}"
+    fi
+}
+
+cleanup_existing_awg() {
+    # Same scope as the `uninstall` subcommand minus the user-facing prompts.
+    # Only awg-named units, our config dir, our state dir, our sysctl file,
+    # our hook scripts, and the amnezia_* nft tables are touched.
+    log "Cleaning up existing AmneziaWG installation..."
+    systemctl disable --now "$SVC" 2>/dev/null || true
+
+    nft delete table inet "$NFT_T_FWD"  2>/dev/null || true
+    nft delete table ip   "$NFT_T_NAT4" 2>/dev/null || true
+    nft delete table ip6  "$NFT_T_NAT6" 2>/dev/null || true
+
+    if ip link show "$IFACE" >/dev/null 2>&1; then
+        # If the unit didn't manage to bring the link down (e.g. failed state),
+        # bring the interface down ourselves — but only if it's named exactly
+        # awg0, never any other interface.
+        ip link set "$IFACE" down 2>/dev/null || true
+        ip link delete "$IFACE" 2>/dev/null || true
+    fi
+
+    rm -f "$SYSCTL_FILE"
+    sysctl --system >/dev/null 2>&1 || true
+
+    rm -f "$HOOK_UP" "$HOOK_DOWN" "$AWG_CONF"
+    rm -f "$AWG_DIR/server.key" "$AWG_DIR/server.pub"
+    # Only remove $AWG_DIR if we created it and it's now empty — never recursive.
+    rmdir "$AWG_DIR" 2>/dev/null || true
+    rmdir "$(dirname "$AWG_DIR")" 2>/dev/null || true
+
+    rm -rf "$STATE_DIR"
+    log "Cleanup complete."
+}
+
+maybe_cleanup_existing() {
+    local findings
+    findings=$(detect_existing_awg || true)
+    [ -z "$findings" ] && return 0
+
+    warn "Existing AmneziaWG artefacts detected:"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        printf '  - %s\n' "$line" >&2
+    done <<<"$findings"
+
+    info "(Stock WireGuard, /etc/wireguard/, wg-quick@*, and any other VPNs will NOT be touched.)"
+
+    local do_clean=0
+    if [ "${AMNEZIA_FORCE_CLEANUP:-0}" = "1" ]; then
+        do_clean=1
+    elif [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ]; then
+        warn "Non-interactive mode and AMNEZIA_FORCE_CLEANUP not set; aborting to avoid stomping."
+        die "Set AMNEZIA_FORCE_CLEANUP=1 to auto-clean, or run '$0 uninstall --purge' first."
+    elif ask_yn "Remove these AmneziaWG artefacts and reinstall fresh?" "y"; then
+        do_clean=1
+    fi
+
+    [ "$do_clean" -eq 1 ] || die "Aborted; existing installation left untouched."
+    cleanup_existing_awg
 }
 
 # ---------------------------------------------------------------------------
@@ -858,12 +1080,7 @@ do_install() {
     detect_os
     info "Detected OS: $PRETTY_NAME"
 
-    if [ -f "$META_FILE" ]; then
-        warn "An existing installation was found at $META_FILE."
-        if ! ask_yn "Reinstall? (existing keys/clients will be reused if present)" "n"; then
-            die "Aborted."
-        fi
-    fi
+    maybe_cleanup_existing
 
     # ---- gather inputs ------------------------------------------------------
     local detected_ip4 detected_ip6 default_host wan
@@ -967,20 +1184,25 @@ EOF
         add_client "$first_client"
     fi
 
+    # ---- stage a copy of ourselves for later subcommands & self-update ------
+    install_self_to_state
+
     cat <<EOF
 
 ${C_GRN}AmneziaWG server is up.${C_RST}
-  Service     : ${SVC}  ($(systemctl is-active "$SVC"))
-  Endpoint    : ${HOST}:${PORT}/udp
-  Server pub  : ${SERVER_PUB}
+  Service       : ${SVC}  ($(systemctl is-active "$SVC"))
+  Endpoint      : ${HOST}:${PORT}/udp
+  Server pub    : ${SERVER_PUB}
+  Local script  : ${INSTALLED_SELF}  (also at ${SYMLINK})
 
 Next steps:
   • Open UDP/${PORT} inbound on any cloud-provider firewall.
-  • To add another client:    sudo $0 add-client <name>
-  • To list clients:           sudo $0 list-clients
-  • To revoke a client:        sudo $0 remove-client <name>
-  • To check status:           sudo $0 status
-  • To uninstall:              sudo $0 uninstall [--purge]
+  • To add another client:    sudo ${SCRIPT_NAME} add-client <name>
+  • To list clients:           sudo ${SCRIPT_NAME} list-clients
+  • To revoke a client:        sudo ${SCRIPT_NAME} remove-client <name>
+  • To check status:           sudo ${SCRIPT_NAME} status
+  • To force an update check:  sudo ${SCRIPT_NAME} self-update --force
+  • To uninstall:              sudo ${SCRIPT_NAME} uninstall [--purge]
 EOF
 }
 
@@ -1005,7 +1227,15 @@ Usage:
   sudo $0 list-clients
   sudo $0 show-client   <name>
   sudo $0 status
+  sudo $0 self-update [--force]      # force a network check + re-exec
+  sudo $0 version
   sudo $0 uninstall [--purge]
+
+After install the script lives at ${INSTALLED_SELF}
+and is symlinked at ${SYMLINK}, so 'sudo ${SCRIPT_NAME} <cmd>' works directly.
+The script auto-checks for updates against the URL above (cached for 24 h).
+Set AMNEZIA_NO_UPDATE_CHECK=1 to suppress; AMNEZIA_FORCE_CLEANUP=1 to skip the
+existing-install-detection prompt during reinstalls.
 
 See the comment header at the top of this script for non-interactive env vars.
 EOF
@@ -1013,6 +1243,14 @@ EOF
 
 main() {
     local cmd="${1:-install}"
+
+    # Skip the network call for read-only / destructive / help commands. For
+    # everything else, opportunistically self-update (cached for a day).
+    case "$cmd" in
+        -h|--help|help|version|--version|uninstall|status|list-clients) ;;
+        *) self_update "$@" ;;
+    esac
+
     case "$cmd" in
         install)
             shift || true
@@ -1036,6 +1274,13 @@ main() {
         uninstall)
             need_root; shift; uninstall "${1:-}"
             ;;
+        self-update)
+            need_root; shift; self_update --force "$@"
+            info "Already running ${SCRIPT_VERSION}; nothing newer found."
+            ;;
+        version|--version)
+            printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+            ;;
         -h|--help|help)
             usage
             ;;
@@ -1045,4 +1290,17 @@ main() {
     esac
 }
 
-main "$@"
+# Make `curl -fsSL ... | sudo bash` actually interactive: when our stdin is the
+# pipe carrying the script source (so `read` would hit the script bytes), but a
+# controlling terminal can actually be opened, redirect the *main* invocation's
+# stdin from /dev/tty so prompts read the user's keyboard. We probe with a
+# subshell open instead of `[ -r /dev/tty ]` because the latter reports true on
+# unopenable tty device nodes (containers, CI runners, cron, systemd units).
+# The redirect is local to the main call — bash's own script-source stdin (the
+# pipe) stays intact, so the parser won't suddenly start reading commands from
+# the user's tty after main returns.
+if [ ! -t 0 ] && ( : </dev/tty ) 2>/dev/null; then
+    main "$@" </dev/tty
+else
+    main "$@"
+fi
