@@ -59,8 +59,8 @@
 #
 # Client config files are saved as <host>-<clientname>.conf (e.g.
 # "vpn.example.com-maciej.conf") so a bulk import into the AmneziaVPN client
-# stays self-describing. Files created by older versions ("<clientname>.conf")
-# are migrated in place on first invocation; lookups still match either form.
+# stays self-describing. This is the only filename format the script knows
+# about; pre-1.2 unprefixed files are not migrated.
 #
 # Self-update: on every invocation the script compares its own SCRIPT_VERSION
 # tag against the version found at the URL above; if newer it downloads,
@@ -77,7 +77,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.2.1"
 readonly SCRIPT_NAME="amnezia-installer"
 readonly IFACE="awg0"
 readonly SVC="awg-quick@${IFACE}.service"
@@ -476,28 +476,44 @@ maybe_cleanup_existing() {
 # caller proceeds with a fresh install; everything else exits the script.
 # ---------------------------------------------------------------------------
 existing_install_menu() {
-    # Best-effort: if the meta file is present and parseable, load it so the
-    # client-mgmt actions have HOST/PORT/keys handy. If it isn't, the user can
-    # still pick Reinstall or Uninstall.
+    # Best-effort: try to load the meta file so the client-mgmt actions have
+    # HOST/PORT/keys handy. When meta is missing or unreadable, those options
+    # would die inside load_meta — so we build the option list dynamically and
+    # only expose the universal entries (Cleanup / Uninstall / Uninstall+purge
+    # / Exit) in that degraded state.
+    local has_meta=0
     if [ -r "$META_FILE" ]; then
         # shellcheck disable=SC1090
-        . "$META_FILE" || true
-        migrate_client_filenames || true
+        if . "$META_FILE" 2>/dev/null; then
+            has_meta=1
+        fi
+    fi
+    if [ "$has_meta" -ne 1 ]; then
+        warn "Server metadata at $META_FILE is missing or unreadable —"
+        warn "client-management options will be hidden until you reinstall."
     fi
 
     while :; do
         echo
+        local opts=()
+        if [ "$has_meta" -eq 1 ]; then
+            opts+=(
+                "Add client(s)                    (comma-separated names accepted)"
+                "List clients"
+                "Show a client's config + QR code"
+                "Remove a client"
+                "Show server status"
+            )
+        fi
+        opts+=(
+            "Cleanup and reinstall            (regenerates ALL keys; current clients become invalid)"
+            "Uninstall                        (stop service, keep keys/clients in /var/lib)"
+            "Uninstall and purge              (remove everything, including keys/clients)"
+            "Exit"
+        )
+
         local choice
-        choice=$(ask_choice "An AmneziaWG installation already exists. What would you like to do?" 1 \
-            "Add client(s)                    (comma-separated names accepted)" \
-            "List clients" \
-            "Show a client's config + QR code" \
-            "Remove a client" \
-            "Show server status" \
-            "Cleanup and reinstall            (regenerates ALL keys; current clients become invalid)" \
-            "Uninstall                        (stop service, keep keys/clients in /var/lib)" \
-            "Uninstall and purge              (remove everything, including keys/clients)" \
-            "Exit")
+        choice=$(ask_choice "An AmneziaWG installation already exists. What would you like to do?" 1 "${opts[@]}")
         case "$choice" in
             "Add client(s)"*)
                 local names first_path
@@ -929,47 +945,37 @@ client_path() {
 }
 
 resolve_client_path() {
-    # Look up an existing client config by user-facing name. Tries the new
-    # "<host>-<name>.conf" path first, then the legacy "<name>.conf" path
-    # written by v1.0/v1.1. Echoes the resolved path or empty on miss.
-    local name="$1" new_p old_p
-    new_p="$CLIENTS_DIR/$(client_filename "$name")"
-    old_p="$CLIENTS_DIR/${name}.conf"
-    if   [ -f "$new_p" ]; then printf '%s' "$new_p"
-    elif [ -f "$old_p" ]; then printf '%s' "$old_p"
-    fi
-}
-
-migrate_client_filenames() {
-    # Idempotently rename any "<name>.conf" lacking the host prefix to the new
-    # "<host>-<name>.conf" form. Safe to call from any subcommand that touches
-    # clients — this is what makes upgrades from v1.0/v1.1 stabilize.
-    [ -d "$CLIENTS_DIR" ] || return 0
-    [ -n "${HOST:-}" ] || return 0
-    local prefix base new f
-    prefix=$(sanitize_for_filename "$HOST")
-    [ -n "$prefix" ] || return 0
-    for f in "$CLIENTS_DIR"/*.conf; do
-        [ -e "$f" ] || break
-        base=$(basename "$f")
-        case "$base" in
-            "${prefix}-"*) ;;  # already migrated
-            *)
-                new="$CLIENTS_DIR/${prefix}-${base}"
-                if [ ! -e "$new" ]; then
-                    mv -f "$f" "$new" && info "Renamed $base -> $(basename "$new")"
-                fi
-                ;;
-        esac
-    done
+    # Map a user-facing client name to its on-disk config file. Echoes the
+    # resolved path, or empty if no such file exists. The script is still in
+    # active development and there's only one canonical filename format — the
+    # host-prefixed one written by client_filename().
+    local name="$1" p
+    p="$CLIENTS_DIR/$(client_filename "$name")"
+    [ -f "$p" ] && printf '%s' "$p"
 }
 
 next_client_octet4() {
-    # Returns the next free host octet in NET4 starting from .2 (.1 is the server).
-    local used n
-    used=$(awg show "$IFACE" allowed-ips 2>/dev/null \
+    # Return the next free host octet in NET4 starting from .2 (.1 is the
+    # server). The check unions TWO sources:
+    #   (a) `awg show <iface> allowed-ips`  — the live kernel state
+    #   (b) AllowedIPs lines in $AWG_CONF   — the on-disk source of truth
+    #
+    # (b) is essential during a CSV batch add: _add_client_core appends each
+    # new peer to $AWG_CONF immediately but defers `awg syncconf` until the
+    # end of the loop, so during iteration N the live interface still holds
+    # only the pre-batch peers. Without (b) every batched client would race
+    # to the same slot.
+    local used_live used_conf used n
+    used_live=$(awg show "$IFACE" allowed-ips 2>/dev/null \
         | awk '{for(i=2;i<=NF;i++) print $i}' \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true)
+    used_conf=""
+    if [ -f "$AWG_CONF" ]; then
+        used_conf=$(grep -E '^[[:space:]]*AllowedIPs' "$AWG_CONF" \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+            || true)
+    fi
+    used=$(printf '%s\n%s\n' "$used_live" "$used_conf" | sort -u)
     for n in $(seq 2 254); do
         if ! grep -qx "${NET4%.*}.$n" <<<"$used"; then
             printf '%s' "$n"; return
@@ -1080,7 +1086,6 @@ add_client() {
     local name="$1"
     [ -n "$name" ] || die "Usage: $0 add-client <name>"
     load_meta
-    migrate_client_filenames
     local conf
     conf=$(_add_client_core "$name" 1)
     log "Client '$name' added."
@@ -1118,7 +1123,6 @@ add_clients_from_csv() {
     done
 
     load_meta
-    migrate_client_filenames
 
     local conf
     for n in "${unique[@]}"; do
@@ -1139,7 +1143,6 @@ remove_client() {
     local name="$1"
     [ -n "$name" ] || die "Usage: $0 remove-client <name>"
     load_meta
-    migrate_client_filenames
 
     local conf
     conf=$(resolve_client_path "$name")
@@ -1167,22 +1170,18 @@ remove_client() {
 
 list_clients() {
     load_meta
-    migrate_client_filenames
     [ -d "$CLIENTS_DIR" ] || { info "No clients configured."; return; }
     local count=0 prefix
     prefix=$(sanitize_for_filename "$HOST")
+    [ -n "$prefix" ] || { info "No clients configured."; return; }
     printf '%-32s %-18s %s\n' "NAME" "IPv4" "IPv6"
-    for f in "$CLIENTS_DIR"/*.conf; do
+    # Glob only files that match this host's prefix; anything else under
+    # CLIENTS_DIR is unrelated and shouldn't be shown.
+    for f in "$CLIENTS_DIR"/"${prefix}"-*.conf; do
         [ -e "$f" ] || break
         local base name addr v4 v6
         base=$(basename "$f" .conf)
-        # Strip the host prefix if present so the displayed name is the
-        # user-facing one. Falls back gracefully on legacy "<name>.conf".
-        if [ -n "$prefix" ] && [ "${base#"${prefix}"-}" != "$base" ]; then
-            name="${base#"${prefix}"-}"
-        else
-            name="$base"
-        fi
+        name="${base#"${prefix}"-}"
         addr=$(awk -F'= *' '/^Address/ {print $2; exit}' "$f")
         v4=$(printf '%s' "$addr" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
         v6=$(printf '%s' "$addr" | grep -oE '[0-9a-fA-F:]+:+[0-9a-fA-F:]+' | head -n1)
@@ -1196,7 +1195,6 @@ show_client() {
     local name="$1"
     [ -n "$name" ] || die "Usage: $0 show-client <name>"
     load_meta
-    migrate_client_filenames
     local conf
     conf=$(resolve_client_path "$name")
     [ -n "$conf" ] || die "No such client: $name"
@@ -1400,9 +1398,10 @@ do_install() {
     # subcommand or directly from /var/lib/amnezia-installer/clients/.
     CLIENTS_CSV="${AMNEZIA_CLIENT_NAME:-client1}"
     CLIENTS_CSV=$(ask "Initial client name(s) — comma-separated (e.g. 'maciej,alice,bob')" "$CLIENTS_CSV")
-    # Validate every name up-front so the user finds out about typos before
-    # we install packages.
-    local n
+    # Validate every name up-front, AND require at least one survives trimming,
+    # so an input like ", ," or "" can't slip past this gate and only fail
+    # halfway through the install (after packages + service start).
+    local n _valid_count=0
     IFS=',' read -ra _check_names <<<"$CLIENTS_CSV"
     for n in "${_check_names[@]}"; do
         n="${n#"${n%%[![:space:]]*}"}"
@@ -1410,8 +1409,11 @@ do_install() {
         [ -z "$n" ] && continue
         valid_client_name "$n" \
             || die "Invalid client name '$n' (allowed: [a-zA-Z0-9_.-], 1-32 chars)."
+        _valid_count=$((_valid_count + 1))
     done
     unset _check_names
+    [ "$_valid_count" -gt 0 ] \
+        || die "Need at least one client name; got '$CLIENTS_CSV' which trims to nothing."
 
     # ---- summary ------------------------------------------------------------
     cat <<EOF
@@ -1584,10 +1586,9 @@ main() {
             need_root; shift
             local arg="${1:-}"
             [ -n "$arg" ] || die "Usage: $0 add-client <name>[,<name>,...]"
-            # Accept either a single name (legacy) or a comma-separated list.
+            # Accept either a single name or a comma-separated list.
             if [[ "$arg" == *,* ]]; then
                 load_meta
-                migrate_client_filenames
                 local first
                 first=$(add_clients_from_csv "$arg")
                 [ -n "$first" ] && show_client_payload "$first"
