@@ -44,7 +44,10 @@
 #   AMNEZIA_HOST=<ip-or-fqdn>    public endpoint clients dial
 #   AMNEZIA_PORT=<udp-port>      listen port
 #   AMNEZIA_OBFUSCATION=off|standard|aggressive
-#   AMNEZIA_CLIENT_NAME=<name>   first client name (default: client1)
+#   AMNEZIA_CLIENT_NAME=<csv>    comma-separated list of clients to create on install
+#                                (default: client1). Only the FIRST one is rendered
+#                                + QR'd at the end; the rest live under
+#                                /var/lib/amnezia-installer/clients/.
 #   AMNEZIA_ENABLE_IPV6=auto|yes|no
 #   AMNEZIA_NET4=10.66.66.0/24
 #   AMNEZIA_NET6=fd86:ea04:1115::/64
@@ -52,6 +55,12 @@
 #   AMNEZIA_MTU=1280
 #   AMNEZIA_NO_UPDATE_CHECK=1    skip the on-startup self-update check
 #   AMNEZIA_FORCE_CLEANUP=1      auto-clean any existing AmneziaWG install before reinstalling
+#   AMNEZIA_NO_SHELL_DROP=1      do not exec $SHELL at /var/lib/amnezia-installer on completion
+#
+# Client config files are saved as <host>-<clientname>.conf (e.g.
+# "vpn.example.com-maciej.conf") so a bulk import into the AmneziaVPN client
+# stays self-describing. Files created by older versions ("<clientname>.conf")
+# are migrated in place on first invocation; lookups still match either form.
 #
 # Self-update: on every invocation the script compares its own SCRIPT_VERSION
 # tag against the version found at the URL above; if newer it downloads,
@@ -68,7 +77,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly SCRIPT_NAME="amnezia-installer"
 readonly IFACE="awg0"
 readonly SVC="awg-quick@${IFACE}.service"
@@ -423,6 +432,11 @@ cleanup_existing_awg() {
 }
 
 maybe_cleanup_existing() {
+    # Called from do_install. If we find AmneziaWG artefacts:
+    #   - in interactive mode, drop into the menu (where the user can manage
+    #     clients, inspect status, or pick "cleanup and reinstall");
+    #   - in non-interactive mode, only proceed when AMNEZIA_FORCE_CLEANUP=1,
+    #     never silently nuke an existing install.
     local findings
     findings=$(detect_existing_awg || true)
     [ -z "$findings" ] && return 0
@@ -435,18 +449,103 @@ maybe_cleanup_existing() {
 
     info "(Stock WireGuard, /etc/wireguard/, wg-quick@*, and any other VPNs will NOT be touched.)"
 
-    local do_clean=0
     if [ "${AMNEZIA_FORCE_CLEANUP:-0}" = "1" ]; then
-        do_clean=1
-    elif [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ]; then
+        cleanup_existing_awg
+        return 0
+    fi
+    if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ]; then
         warn "Non-interactive mode and AMNEZIA_FORCE_CLEANUP not set; aborting to avoid stomping."
         die "Set AMNEZIA_FORCE_CLEANUP=1 to auto-clean, or run '$0 uninstall --purge' first."
-    elif ask_yn "Remove these AmneziaWG artefacts and reinstall fresh?" "y"; then
-        do_clean=1
     fi
 
-    [ "$do_clean" -eq 1 ] || die "Aborted; existing installation left untouched."
-    cleanup_existing_awg
+    # Interactive: hand off to the menu. It either calls back to the caller
+    # (return 0 == "user picked Reinstall, please clean up") or exits the
+    # script outright on Uninstall / Exit / etc.
+    if existing_install_menu; then
+        cleanup_existing_awg
+    else
+        # The menu indicated "user is done with this run, do not reinstall".
+        exit 0
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Interactive management menu shown when the script is invoked on a host that
+# already has an AmneziaWG install. Most options just call the corresponding
+# subcommand handler and loop back; "Cleanup and reinstall" returns 0 so the
+# caller proceeds with a fresh install; everything else exits the script.
+# ---------------------------------------------------------------------------
+existing_install_menu() {
+    # Best-effort: if the meta file is present and parseable, load it so the
+    # client-mgmt actions have HOST/PORT/keys handy. If it isn't, the user can
+    # still pick Reinstall or Uninstall.
+    if [ -r "$META_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$META_FILE" || true
+        migrate_client_filenames || true
+    fi
+
+    while :; do
+        echo
+        local choice
+        choice=$(ask_choice "An AmneziaWG installation already exists. What would you like to do?" 1 \
+            "Add client(s)                    (comma-separated names accepted)" \
+            "List clients" \
+            "Show a client's config + QR code" \
+            "Remove a client" \
+            "Show server status" \
+            "Cleanup and reinstall            (regenerates ALL keys; current clients become invalid)" \
+            "Uninstall                        (stop service, keep keys/clients in /var/lib)" \
+            "Uninstall and purge              (remove everything, including keys/clients)" \
+            "Exit")
+        case "$choice" in
+            "Add client(s)"*)
+                local names first_path
+                names=$(ask "Client name(s), comma-separated" "client1")
+                first_path=$(add_clients_from_csv "$names")
+                info "Done. Configs are in $CLIENTS_DIR — use 'Show a client's config' to print/QR any of them."
+                if [ -n "$first_path" ] && ask_yn "Show + QR the first client's config now?" "y"; then
+                    show_client_payload "$first_path"
+                fi
+                ;;
+            "List clients")
+                list_clients
+                ;;
+            "Show a client's config"*)
+                local name
+                name=$(ask "Client name to show" "")
+                [ -n "$name" ] && show_client "$name"
+                ;;
+            "Remove a client")
+                local name
+                name=$(ask "Client name to revoke" "")
+                if [ -n "$name" ] && ask_yn "Really revoke '$name'?" "n"; then
+                    remove_client "$name"
+                fi
+                ;;
+            "Show server status")
+                status
+                ;;
+            "Cleanup and reinstall"*)
+                if ask_yn "Confirm: ALL existing keys and clients will be regenerated. Continue?" "n"; then
+                    return 0
+                fi
+                ;;
+            "Uninstall and purge"*)
+                if ask_yn "Confirm: remove the server AND wipe all keys/clients?" "n"; then
+                    uninstall --purge
+                    exit 0
+                fi
+                ;;
+            "Uninstall"*)
+                uninstall
+                exit 0
+                ;;
+            "Exit")
+                return 1
+                ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -803,6 +902,68 @@ load_meta() {
 # ---------------------------------------------------------------------------
 # Client peer management
 # ---------------------------------------------------------------------------
+
+sanitize_for_filename() {
+    # Map every character outside [A-Za-z0-9._-] to '_' so things like
+    # IPv6 colons and slashes can never produce illegal-on-import filenames.
+    # Empty input echoes empty (caller is expected to validate non-emptiness).
+    printf '%s' "${1-}" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+valid_client_name() {
+    # The user-facing client name. Conservative on purpose so the name is also
+    # a safe filename component on its own.
+    [[ "$1" =~ ^[a-zA-Z0-9_.-]{1,32}$ ]]
+}
+
+client_filename() {
+    # The on-disk filename for a given client. Uses HOST as the prefix so a
+    # bulk import into the AmneziaVPN client app produces self-describing
+    # entries like "sgp.swic.name-maciej".  Requires HOST to be set.
+    local name="$1"
+    printf '%s-%s.conf' "$(sanitize_for_filename "$HOST")" "$name"
+}
+
+client_path() {
+    printf '%s/%s' "$CLIENTS_DIR" "$(client_filename "$1")"
+}
+
+resolve_client_path() {
+    # Look up an existing client config by user-facing name. Tries the new
+    # "<host>-<name>.conf" path first, then the legacy "<name>.conf" path
+    # written by v1.0/v1.1. Echoes the resolved path or empty on miss.
+    local name="$1" new_p old_p
+    new_p="$CLIENTS_DIR/$(client_filename "$name")"
+    old_p="$CLIENTS_DIR/${name}.conf"
+    if   [ -f "$new_p" ]; then printf '%s' "$new_p"
+    elif [ -f "$old_p" ]; then printf '%s' "$old_p"
+    fi
+}
+
+migrate_client_filenames() {
+    # Idempotently rename any "<name>.conf" lacking the host prefix to the new
+    # "<host>-<name>.conf" form. Safe to call from any subcommand that touches
+    # clients — this is what makes upgrades from v1.0/v1.1 stabilize.
+    [ -d "$CLIENTS_DIR" ] || return 0
+    [ -n "${HOST:-}" ] || return 0
+    local prefix base new f
+    prefix=$(sanitize_for_filename "$HOST")
+    [ -n "$prefix" ] || return 0
+    for f in "$CLIENTS_DIR"/*.conf; do
+        [ -e "$f" ] || break
+        base=$(basename "$f")
+        case "$base" in
+            "${prefix}-"*) ;;  # already migrated
+            *)
+                new="$CLIENTS_DIR/${prefix}-${base}"
+                if [ ! -e "$new" ]; then
+                    mv -f "$f" "$new" && info "Renamed $base -> $(basename "$new")"
+                fi
+                ;;
+        esac
+    done
+}
+
 next_client_octet4() {
     # Returns the next free host octet in NET4 starting from .2 (.1 is the server).
     local used n
@@ -823,14 +984,24 @@ next_client_id6() {
     printf '%s' "${NET6%::*}::$(printf '%x' "$octet")"
 }
 
-add_client() {
-    local name="$1"
-    [ -n "$name" ] || die "Usage: $0 add-client <name>"
-    [[ "$name" =~ ^[a-zA-Z0-9_.-]{1,32}$ ]] \
-        || die "Client name must match [a-zA-Z0-9_.-] (max 32 chars)."
-    [ ! -e "$CLIENTS_DIR/${name}.conf" ] || die "Client '$name' already exists."
+_add_client_core() {
+    # Silent worker: writes the client config + appends the peer to the server
+    # config + (optionally) syncs the live interface. Echoes the output path.
+    # Caller is responsible for any user-facing rendering.
+    local name="$1" sync_now="${2:-1}"
+    valid_client_name "$name" \
+        || die "Client name '$name' must match [a-zA-Z0-9_.-] (max 32 chars)."
 
-    load_meta
+    # Reject either the new or legacy filename so we never collide on upgrade.
+    if [ -n "$(resolve_client_path "$name")" ]; then
+        die "Client '$name' already exists."
+    fi
+    # Also reject when an existing peer block in the server config carries the
+    # same friendly-name marker — covers the case where the .conf file was
+    # deleted but the server-side peer entry was left behind.
+    if [ -f "$AWG_CONF" ] && grep -qx "# BEGIN_PEER $name" "$AWG_CONF"; then
+        die "A peer named '$name' already exists in $AWG_CONF."
+    fi
 
     local priv pub psk octet ip4 ip6 allowed_ips client_addr
     priv=$(awg genkey)
@@ -848,7 +1019,8 @@ add_client() {
         allowed_ips="${ip4}/32"
     fi
 
-    # Append peer to server config and inject live without restarting the tunnel.
+    # Append peer to server config so awg-quick(8) sees it on next start AND
+    # awg syncconf can reconcile the live interface without a restart.
     {
         echo ""
         echo "# BEGIN_PEER $name"
@@ -860,17 +1032,16 @@ add_client() {
         echo "# END_PEER $name"
     } >>"$AWG_CONF"
 
-    if systemctl is-active --quiet "$SVC"; then
-        # Live reconfigure: strip the script-only sections awg(8) doesn't grok and reload.
-        local stripped
-        stripped=$(awg-quick strip "$IFACE")
-        printf '%s' "$stripped" | awg syncconf "$IFACE" /dev/stdin
+    if [ "$sync_now" = "1" ] && systemctl is-active --quiet "$SVC"; then
+        awg syncconf "$IFACE" <(awg-quick strip "$IFACE")
     fi
 
-    # Build the client config.
-    local conf="$CLIENTS_DIR/${name}.conf"
+    # Build the per-client config file.
+    install -d -m 0700 "$CLIENTS_DIR"
+    local conf
+    conf=$(client_path "$name")
     {
-        echo "# AmneziaWG client config for '$name' — generated $(date -u +%FT%TZ)"
+        echo "# AmneziaWG client config for '$name' on ${HOST} — generated $(date -u +%FT%TZ)"
         echo "[Interface]"
         echo "PrivateKey = $priv"
         echo "Address = $client_addr"
@@ -901,18 +1072,82 @@ add_client() {
     } >"$conf"
     chmod 600 "$conf"
 
+    printf '%s' "$conf"
+}
+
+add_client() {
+    # User-facing wrapper — adds one client and prints config + QR.
+    local name="$1"
+    [ -n "$name" ] || die "Usage: $0 add-client <name>"
+    load_meta
+    migrate_client_filenames
+    local conf
+    conf=$(_add_client_core "$name" 1)
     log "Client '$name' added."
     info "Config: $conf"
     show_client_payload "$conf"
+}
+
+add_clients_from_csv() {
+    # Used by the install flow and by the menu's "Add client(s)" entry.
+    # Argument: a comma-separated list. All clients are configured; only the
+    # FIRST is rendered + QR'd. Echoes the path of the first config so the
+    # caller can reference it in summary output. The live awg syncconf runs
+    # only once at the end so all peers are picked up in a single reload.
+    local csv="$1" first="" raw n names=()
+    [ -n "$csv" ] || die "No client names provided."
+    IFS=',' read -ra raw <<<"$csv"
+    for n in "${raw[@]}"; do
+        # trim leading/trailing whitespace
+        n="${n#"${n%%[![:space:]]*}"}"
+        n="${n%"${n##*[![:space:]]}"}"
+        [ -z "$n" ] && continue
+        valid_client_name "$n" \
+            || die "Invalid client name '$n' (allowed: [a-zA-Z0-9_.-], 1-32 chars)."
+        names+=("$n")
+    done
+    [ "${#names[@]}" -gt 0 ] || die "No valid client names parsed from '$csv'."
+
+    # Dedupe while preserving order so add_clients "a,b,a" == "a,b".
+    local -A seen=()
+    local unique=()
+    for n in "${names[@]}"; do
+        [ -n "${seen[$n]:-}" ] && continue
+        seen[$n]=1
+        unique+=("$n")
+    done
+
+    load_meta
+    migrate_client_filenames
+
+    local conf
+    for n in "${unique[@]}"; do
+        # Defer the live syncconf until the last peer to avoid N reloads.
+        conf=$(_add_client_core "$n" 0)
+        [ -z "$first" ] && first="$conf"
+        log "Configured client '$n' -> $conf"
+    done
+
+    if systemctl is-active --quiet "$SVC"; then
+        awg syncconf "$IFACE" <(awg-quick strip "$IFACE")
+    fi
+
+    [ -n "$first" ] && printf '%s' "$first"
 }
 
 remove_client() {
     local name="$1"
     [ -n "$name" ] || die "Usage: $0 remove-client <name>"
     load_meta
-    [ -f "$CLIENTS_DIR/${name}.conf" ] || die "No such client: $name"
+    migrate_client_filenames
 
-    # Remove the BEGIN_PEER..END_PEER block from the server config.
+    local conf
+    conf=$(resolve_client_path "$name")
+    [ -n "$conf" ] || die "No such client: $name"
+
+    # Remove the BEGIN_PEER..END_PEER block (matched on the friendly name we
+    # wrote when the peer was created — never on the public key, which we may
+    # not still have in the file path).
     local tmp; tmp=$(mktemp)
     awk -v n="$name" '
         $0 == "# BEGIN_PEER " n { skip=1; next }
@@ -926,23 +1161,32 @@ remove_client() {
         # Reconcile the running interface with the freshly-edited config.
         awg syncconf "$IFACE" <(awg-quick strip "$IFACE")
     fi
-    rm -f "$CLIENTS_DIR/${name}.conf"
+    rm -f "$conf"
     log "Client '$name' revoked."
 }
 
 list_clients() {
     load_meta
+    migrate_client_filenames
     [ -d "$CLIENTS_DIR" ] || { info "No clients configured."; return; }
-    local count=0
-    printf '%-24s %-18s %s\n' "NAME" "IPv4" "IPv6"
+    local count=0 prefix
+    prefix=$(sanitize_for_filename "$HOST")
+    printf '%-32s %-18s %s\n' "NAME" "IPv4" "IPv6"
     for f in "$CLIENTS_DIR"/*.conf; do
         [ -e "$f" ] || break
-        local name addr v4 v6
-        name=$(basename "$f" .conf)
+        local base name addr v4 v6
+        base=$(basename "$f" .conf)
+        # Strip the host prefix if present so the displayed name is the
+        # user-facing one. Falls back gracefully on legacy "<name>.conf".
+        if [ -n "$prefix" ] && [ "${base#"${prefix}"-}" != "$base" ]; then
+            name="${base#"${prefix}"-}"
+        else
+            name="$base"
+        fi
         addr=$(awk -F'= *' '/^Address/ {print $2; exit}' "$f")
         v4=$(printf '%s' "$addr" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
         v6=$(printf '%s' "$addr" | grep -oE '[0-9a-fA-F:]+:+[0-9a-fA-F:]+' | head -n1)
-        printf '%-24s %-18s %s\n' "$name" "${v4:--}" "${v6:--}"
+        printf '%-32s %-18s %s\n' "$name" "${v4:--}" "${v6:--}"
         count=$((count+1))
     done
     [ "$count" -gt 0 ] || info "No clients configured."
@@ -952,8 +1196,11 @@ show_client() {
     local name="$1"
     [ -n "$name" ] || die "Usage: $0 show-client <name>"
     load_meta
-    [ -f "$CLIENTS_DIR/${name}.conf" ] || die "No such client: $name"
-    show_client_payload "$CLIENTS_DIR/${name}.conf"
+    migrate_client_filenames
+    local conf
+    conf=$(resolve_client_path "$name")
+    [ -n "$conf" ] || die "No such client: $name"
+    show_client_payload "$conf"
 }
 
 show_client_payload() {
@@ -1147,6 +1394,25 @@ do_install() {
     wan=$(ask "Egress (WAN) interface for NAT" "$wan")
     ip link show "$wan" >/dev/null 2>&1 || warn "Interface '$wan' not found right now; will be used at service start."
 
+    # ----- Initial client roster --------------------------------------------
+    # A comma-separated list — the first one will be displayed + QR'd at the
+    # end; the rest are saved for later retrieval via the 'show-client'
+    # subcommand or directly from /var/lib/amnezia-installer/clients/.
+    CLIENTS_CSV="${AMNEZIA_CLIENT_NAME:-client1}"
+    CLIENTS_CSV=$(ask "Initial client name(s) — comma-separated (e.g. 'maciej,alice,bob')" "$CLIENTS_CSV")
+    # Validate every name up-front so the user finds out about typos before
+    # we install packages.
+    local n
+    IFS=',' read -ra _check_names <<<"$CLIENTS_CSV"
+    for n in "${_check_names[@]}"; do
+        n="${n#"${n%%[![:space:]]*}"}"
+        n="${n%"${n##*[![:space:]]}"}"
+        [ -z "$n" ] && continue
+        valid_client_name "$n" \
+            || die "Invalid client name '$n' (allowed: [a-zA-Z0-9_.-], 1-32 chars)."
+    done
+    unset _check_names
+
     # ---- summary ------------------------------------------------------------
     cat <<EOF
 
@@ -1158,6 +1424,7 @@ ${C_BOLD}Installation summary${C_RST}
   DNS pushed      : ${DNS}
   MTU             : ${MTU}
   Obfuscation     : ${OBFUSCATION}$([ "$OBFUSCATION" != "off" ] && printf ' (Jc=%s Jmin=%s Jmax=%s S1=%s S2=%s)' "$JC" "$JMIN" "$JMAX" "$S1" "$S2")
+  Initial clients : ${CLIENTS_CSV}
 
 EOF
     ask_yn "Proceed?" "y" || die "Aborted by user."
@@ -1177,12 +1444,11 @@ EOF
     systemctl is-active --quiet "$SVC" \
         || die "$SVC failed to start. Inspect: journalctl -u $SVC -n 40 --no-pager"
 
-    # ---- first client -------------------------------------------------------
-    local first_client="${AMNEZIA_CLIENT_NAME:-client1}"
-    if [ ! -e "$CLIENTS_DIR/${first_client}.conf" ]; then
-        log "Creating first client '${first_client}'..."
-        add_client "$first_client"
-    fi
+    # ---- initial client roster ---------------------------------------------
+    # All clients in the CSV are configured; only the FIRST is shown + QR'd.
+    log "Creating initial client(s): ${CLIENTS_CSV}"
+    local first_conf
+    first_conf=$(add_clients_from_csv "$CLIENTS_CSV")
 
     # ---- stage a copy of ourselves for later subcommands & self-update ------
     install_self_to_state
@@ -1194,6 +1460,7 @@ ${C_GRN}AmneziaWG server is up.${C_RST}
   Endpoint      : ${HOST}:${PORT}/udp
   Server pub    : ${SERVER_PUB}
   Local script  : ${INSTALLED_SELF}  (also at ${SYMLINK})
+  Clients dir   : ${CLIENTS_DIR}
 
 Next steps:
   • Open UDP/${PORT} inbound on any cloud-provider firewall.
@@ -1204,6 +1471,45 @@ Next steps:
   • To force an update check:  sudo ${SCRIPT_NAME} self-update --force
   • To uninstall:              sudo ${SCRIPT_NAME} uninstall [--purge]
 EOF
+
+    # ---- render the FIRST client (config + QR) ------------------------------
+    if [ -n "$first_conf" ] && [ -f "$first_conf" ]; then
+        echo
+        info "Showing the first client only. The rest are saved as ${CLIENTS_DIR}/<host>-<name>.conf"
+        info "and can be re-rendered any time with: sudo ${SCRIPT_NAME} show-client <name>"
+        show_client_payload "$first_conf"
+    fi
+
+    # ---- drop the user into a shell at the install dir so they can keep ----
+    # working with the script and the clients/ directory locally. exec()
+    # replaces this process, so anything below MUST run before the exec.
+    drop_into_install_shell
+}
+
+drop_into_install_shell() {
+    # Skip in non-interactive runs and when the operator opted out.
+    [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ] && return 0
+    [ "${AMNEZIA_NO_SHELL_DROP:-0}" = "1" ] && return 0
+    # Only meaningful when we have a tty to drop into. The same probe we use
+    # at the entrypoint applies here — `[ -t 0 ]` already covers our redirected
+    # case because main was invoked with </dev/tty in the pipe-to-bash flow.
+    [ -t 0 ] || return 0
+
+    [ -d "$STATE_DIR" ] || return 0
+
+    if ! ask_yn "Drop into a shell at ${STATE_DIR} so you can keep working with the script?" "y"; then
+        info "Skipping shell drop. You can return any time with: cd ${STATE_DIR}"
+        return 0
+    fi
+
+    cd "$STATE_DIR" || { warn "Could not cd to $STATE_DIR; staying put."; return 0; }
+    local sh="${SHELL:-/bin/bash}"
+    [ -x "$sh" ] || sh="/bin/bash"
+    info "Launching ${sh} in ${PWD}. Type 'exit' to leave."
+    # `exec` so the user's shell becomes the process the original caller
+    # waits on; works inside `curl | sudo bash` because main's stdin was
+    # redirected from /dev/tty at the entrypoint.
+    exec "$sh"
 }
 
 # ---------------------------------------------------------------------------
@@ -1221,8 +1527,12 @@ Quick install (always pulls the latest from the main branch):
   sudo bash -c "\$(curl -fsSL https://raw.githubusercontent.com/maciekish/amnezia-installer/main/amnezia-installer.sh)"
 
 Usage:
-  sudo $0 [install]                  # interactive install (default)
-  sudo $0 add-client    <name>
+  sudo $0 [install]                  # interactive install (default).
+                                     # On a host with an existing install,
+                                     # opens an interactive menu (add/list/show/
+                                     # remove/status/reinstall/uninstall/exit).
+  sudo $0 menu                       # same management menu without trying to install.
+  sudo $0 add-client    <names>      # comma-separated names accepted, e.g. "alice,bob".
   sudo $0 remove-client <name>
   sudo $0 list-clients
   sudo $0 show-client   <name>
@@ -1231,11 +1541,14 @@ Usage:
   sudo $0 version
   sudo $0 uninstall [--purge]
 
+Client config files are stored as ${CLIENTS_DIR}/<host>-<name>.conf
+so a bulk import into the AmneziaVPN client app stays self-describing.
 After install the script lives at ${INSTALLED_SELF}
 and is symlinked at ${SYMLINK}, so 'sudo ${SCRIPT_NAME} <cmd>' works directly.
 The script auto-checks for updates against the URL above (cached for 24 h).
 Set AMNEZIA_NO_UPDATE_CHECK=1 to suppress; AMNEZIA_FORCE_CLEANUP=1 to skip the
-existing-install-detection prompt during reinstalls.
+existing-install-detection prompt during reinstalls; AMNEZIA_NO_SHELL_DROP=1
+to skip the post-install 'cd into install dir' shell drop.
 
 See the comment header at the top of this script for non-interactive env vars.
 EOF
@@ -1256,8 +1569,32 @@ main() {
             shift || true
             do_install "$@"
             ;;
+        menu)
+            need_root
+            [ -r "$META_FILE" ] || die "No installation found at $META_FILE; run '$0 install' first."
+            # The menu function returns 0 if the user picks "Cleanup and reinstall"
+            # — in that case we fall through to do_install. Otherwise it has
+            # already exited the script for us.
+            if existing_install_menu; then
+                cleanup_existing_awg
+                do_install
+            fi
+            ;;
         add-client)
-            need_root; shift; add_client "${1:-}"
+            need_root; shift
+            local arg="${1:-}"
+            [ -n "$arg" ] || die "Usage: $0 add-client <name>[,<name>,...]"
+            # Accept either a single name (legacy) or a comma-separated list.
+            if [[ "$arg" == *,* ]]; then
+                load_meta
+                migrate_client_filenames
+                local first
+                first=$(add_clients_from_csv "$arg")
+                [ -n "$first" ] && show_client_payload "$first"
+                info "All clients written under ${CLIENTS_DIR}/"
+            else
+                add_client "$arg"
+            fi
             ;;
         remove-client)
             need_root; shift; remove_client "${1:-}"
