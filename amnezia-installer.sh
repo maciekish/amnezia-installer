@@ -627,7 +627,7 @@ install_prereqs() {
         apt-get update -qq
         apt-get install -y -qq \
             curl ca-certificates iproute2 nftables qrencode \
-            software-properties-common gpg jq
+            software-properties-common gpg jq kmod
         if [ "${ENABLE_UPNP:-0}" = "1" ]; then
             apt-get install -y -qq miniupnpc
         fi
@@ -668,6 +668,114 @@ install_amneziawg() {
         die "AmneziaWG installation failed: 'awg-quick' not found in PATH."
     fi
     info "AmneziaWG installed: $(awg --version 2>/dev/null | head -n1 || echo present)"
+    ensure_amneziawg_runtime
+}
+
+apt_pkg_available() {
+    apt-cache show "$1" >/dev/null 2>&1
+}
+
+running_kernel() {
+    uname -r
+}
+
+latest_installed_kernel() {
+    # Prefer the modules tree because it works across generic, cloud, lowlatency,
+    # and vendor-flavoured kernels without hard-coding package names.
+    find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
+        | sort -V \
+        | tail -n1
+}
+
+kernel_headers_ready() {
+    local kernel="${1:-$(running_kernel)}"
+    [ -e "/lib/modules/${kernel}/build" ]
+}
+
+install_debian_kernel_build_prereqs() {
+    local kernel headers_pkg packages=()
+    kernel=$(running_kernel)
+    headers_pkg="linux-headers-${kernel}"
+
+    # DKMS needs a compiler toolchain and headers for the *running* kernel.  APT
+    # may install a newer kernel during normal upgrades; that is not enough until
+    # the host has rebooted into it.
+    packages+=(dkms build-essential)
+    if kernel_headers_ready "$kernel"; then
+        info "Kernel headers present for running kernel $kernel."
+    elif apt_pkg_available "$headers_pkg"; then
+        packages+=("$headers_pkg")
+    else
+        warn "APT cannot find $headers_pkg for the running kernel $kernel."
+        warn "If DKMS cannot build AmneziaWG, reboot into an installed kernel with headers or install matching headers manually."
+    fi
+
+    apt-get install -y -qq "${packages[@]}"
+}
+
+print_amneziawg_runtime_diagnostics() {
+    local kernel latest headers_pkg dkms_lines
+    kernel=$(running_kernel)
+    latest=$(latest_installed_kernel || true)
+    headers_pkg="linux-headers-${kernel}"
+
+    err "AmneziaWG runtime is unavailable for the running kernel ($kernel)."
+    err "The service cannot create '$IFACE' because 'ip link add $IFACE type amneziawg' is unsupported."
+
+    if [ -n "$latest" ] && [ "$latest" != "$kernel" ]; then
+        warn "A different kernel appears installed: $latest. Reboot into it, then rerun this installer."
+    fi
+
+    if is_debian_like; then
+        if ! kernel_headers_ready "$kernel"; then
+            if apt_pkg_available "$headers_pkg"; then
+                warn "Missing headers for the running kernel. Install them with: apt-get install $headers_pkg"
+            else
+                warn "No installable $headers_pkg package was found in the enabled APT repositories."
+            fi
+        fi
+        if command -v dkms >/dev/null 2>&1; then
+            dkms_lines=$(dkms status 2>/dev/null | grep -i 'amneziawg' || true)
+            if [ -n "$dkms_lines" ]; then
+                warn "DKMS status for AmneziaWG:"
+                printf '%s\n' "$dkms_lines" >&2
+            else
+                warn "DKMS has no registered AmneziaWG build for this kernel."
+            fi
+        fi
+    fi
+
+    if command -v modinfo >/dev/null 2>&1 && modinfo amneziawg >/dev/null 2>&1; then
+        warn "modinfo can see an amneziawg module, but modprobe failed. Check: modprobe -v amneziawg"
+    else
+        warn "No loadable amneziawg kernel module was found for $kernel."
+    fi
+}
+
+amneziawg_userspace_available() {
+    command -v "${WG_QUICK_USERSPACE_IMPLEMENTATION:-amneziawg-go}" >/dev/null 2>&1
+}
+
+ensure_amneziawg_runtime() {
+    log "Checking AmneziaWG runtime support..."
+
+    if lsmod 2>/dev/null | grep -q '^amneziawg[[:space:]]'; then
+        info "AmneziaWG kernel module is already loaded."
+        return 0
+    fi
+
+    if command -v modprobe >/dev/null 2>&1 && modprobe amneziawg >/dev/null 2>&1; then
+        info "Loaded AmneziaWG kernel module for $(running_kernel)."
+        return 0
+    fi
+
+    if amneziawg_userspace_available; then
+        warn "AmneziaWG kernel module is unavailable; awg-quick will use ${WG_QUICK_USERSPACE_IMPLEMENTATION:-amneziawg-go}."
+        return 0
+    fi
+
+    print_amneziawg_runtime_diagnostics
+    die "Install cannot continue until the AmneziaWG kernel module can load (or amneziawg-go is installed)."
 }
 
 install_amneziawg_apt() {
@@ -691,14 +799,31 @@ EOF
         fi
         apt-get update -qq
     fi
-    # The PPA package "amneziawg" pulls in the kernel module via DKMS; if DKMS
-    # cannot build (custom kernel), apt will fail and we fall back to the
-    # userspace go implementation.
-    if ! apt-get install -y -qq amneziawg amneziawg-tools 2>/dev/null \
-        && ! apt-get install -y -qq amneziawg 2>/dev/null; then
-        warn "Kernel module package failed; installing userspace amneziawg-go fallback."
+
+    install_debian_kernel_build_prereqs
+
+    # The PPA package "amneziawg" pulls in the kernel module via DKMS.  Keep APT
+    # output visible enough to diagnose DKMS/header failures instead of hiding
+    # the root cause behind awg-quick's later "Unknown device type" error.
+    local apt_log
+    apt_log=$(mktemp)
+    if apt-get install -y -qq amneziawg amneziawg-tools 2>"$apt_log" \
+        || apt-get install -y -qq amneziawg 2>>"$apt_log"; then
+        rm -f "$apt_log"
+        return 0
+    fi
+
+    warn "Kernel AmneziaWG package installation failed. Last APT/DKMS output:"
+    tail -n 40 "$apt_log" >&2 || true
+    rm -f "$apt_log"
+
+    if apt_pkg_available amneziawg-go; then
+        warn "Installing userspace amneziawg-go fallback."
         apt-get install -y -qq amneziawg-go amneziawg-tools \
-            || die "Could not install amneziawg* packages from the PPA."
+            || die "Could not install amneziawg-go fallback from the PPA."
+    else
+        print_amneziawg_runtime_diagnostics
+        die "Could not install AmneziaWG packages from the PPA."
     fi
 }
 
@@ -1302,13 +1427,19 @@ do_doctor() {
         "$C_BOLD" "$C_BLU" \
         "${HOST:+ — ${HOST}:${PORT}/udp}" "$C_RST"
 
-    # ── 1. Kernel module ────────────────────────────────────────────────────
+    # ── 1. Kernel/userspace runtime ─────────────────────────────────────────
     if lsmod 2>/dev/null | grep -q '^amneziawg[[:space:]]'; then
-        _doc_pass "kernel module" "amneziawg loaded"
+        _doc_pass "runtime" "amneziawg kernel module loaded"
+    elif command -v modprobe >/dev/null 2>&1 && modprobe amneziawg >/dev/null 2>&1; then
+        _doc_pass "runtime" "amneziawg kernel module loaded by doctor"
+    elif amneziawg_userspace_available; then
+        _doc_warn_line "runtime" "kernel module unavailable; userspace ${WG_QUICK_USERSPACE_IMPLEMENTATION:-amneziawg-go} is present"
+        _warns=$((_warns+1))
     else
-        _doc_fail_line "kernel module" "amneziawg NOT in lsmod — module failed to load"
+        _doc_fail_line "runtime" "no amneziawg kernel module or amneziawg-go userspace fallback"
         _doc_hint "Try: modprobe amneziawg"
-        _doc_hint "Or reinstall the amneziawg package and check dkms status."
+        _doc_hint "Check: dkms status | grep -i amneziawg"
+        _doc_hint "On Debian/Ubuntu, ensure linux-headers-$(uname -r) is installed and reboot if a kernel upgrade is pending."
         _errs=$((_errs+1))
     fi
 
