@@ -82,7 +82,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.4.1"
 readonly SCRIPT_NAME="amnezia-installer"
 readonly IFACE="awg0"
 readonly SVC="awg-quick@${IFACE}.service"
@@ -540,6 +540,7 @@ existing_install_menu() {
                 list_clients
                 ;;
             "Show a client's config"*)
+                list_clients
                 local name
                 name=$(ask "Client name to show" "")
                 [ -n "$name" ] && show_client "$name"
@@ -968,7 +969,7 @@ resolve_client_path() {
     # host-prefixed one written by client_filename().
     local name="$1" p
     p="$CLIENTS_DIR/$(client_filename "$name")"
-    [ -f "$p" ] && printf '%s' "$p"
+    if [ -f "$p" ]; then printf '%s' "$p"; fi
 }
 
 next_client_octet4() {
