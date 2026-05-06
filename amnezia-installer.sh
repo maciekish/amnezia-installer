@@ -398,7 +398,10 @@ install_self_to_state() {
 # /etc/amnezia/amneziawg/, amnezia_* nft tables, our sysctl filename).
 # ---------------------------------------------------------------------------
 detect_existing_awg() {
-    # Echoes one finding per line; empty output == nothing found.
+    # Echoes one finding per line for artefacts that indicate awg0 is still
+    # installed/runnable. Preserved keys, client configs, awg0.conf, and
+    # server.env by themselves are intentionally handled by
+    # detect_preserved_awg() so a non-purge uninstall can be reinstalled cleanly.
     local found=()
 
     if systemctl list-unit-files "$SVC" 2>/dev/null | grep -q "$SVC"; then
@@ -416,13 +419,11 @@ detect_existing_awg() {
         fi
     fi
 
-    [ -e "$AWG_CONF" ]                   && found+=("config file $AWG_CONF")
     [ -e "$HOOK_UP" ] || [ -e "$HOOK_DOWN" ] && found+=("hook scripts in $AWG_DIR")
     [ -e "$UPNP_SCRIPT" ] || [ -e "$UPNP_SERVICE" ] || [ -e "$UPNP_TIMER" ] \
         && found+=("UPnP refresh service/timer")
     ip link show "$IFACE" >/dev/null 2>&1 && found+=("interface '$IFACE' is up")
     [ -e "$SYSCTL_FILE" ]                && found+=("sysctl drop-in $SYSCTL_FILE")
-    [ -e "$META_FILE" ]                  && found+=("state file $META_FILE")
 
     local t
     for t in "$NFT_T_FWD" "$NFT_T_NAT4" "$NFT_T_NAT6"; do
@@ -436,6 +437,19 @@ detect_existing_awg() {
     fi
 }
 
+# Preserved artefacts left by `uninstall` without `--purge`. These prove there
+# are saved settings/clients available, but do not prove the VPN is installed.
+detect_preserved_awg() {
+    local found=()
+    [ -e "$AWG_CONF" ]                  && found+=("preserved config file $AWG_CONF")
+    [ -e "$AWG_DIR/server.key" ]        && found+=("preserved server private key $AWG_DIR/server.key")
+    [ -e "$AWG_DIR/server.pub" ]        && found+=("preserved server public key $AWG_DIR/server.pub")
+    [ -e "$META_FILE" ]                 && found+=("preserved state file $META_FILE")
+    [ -d "$CLIENTS_DIR" ]               && found+=("preserved client configs in $CLIENTS_DIR")
+    if [ "${#found[@]}" -gt 0 ]; then
+        printf '%s\n' "${found[@]}"
+    fi
+}
 cleanup_existing_awg() {
     # Same scope as the `uninstall` subcommand minus the user-facing prompts.
     # Only awg-named units, our config dir, our state dir, our sysctl file,
@@ -481,41 +495,66 @@ cleanup_existing_awg() {
 }
 
 maybe_cleanup_existing() {
-    # Called from do_install. If we find AmneziaWG artefacts:
-    #   - in interactive mode, drop into the menu (where the user can manage
-    #     clients, inspect status, or pick "cleanup and reinstall");
-    #   - in non-interactive mode, only proceed when AMNEZIA_FORCE_CLEANUP=1,
-    #     never silently nuke an existing install.
-    local findings
+    # Called from do_install. If awg0 is still installed/runnable, use the
+    # management menu or an explicit forced cleanup. If only preserved files from
+    # a non-purge uninstall remain, offer a reinstall and let the install flow
+    # use server.env as the prompt defaults.
+    local findings preserved
     findings=$(detect_existing_awg || true)
-    [ -z "$findings" ] && return 0
 
-    warn "Existing AmneziaWG artefacts detected:"
+    if [ -n "$findings" ]; then
+        warn "Existing AmneziaWG installation artefacts detected:"
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            printf '  - %s\n' "$line" >&2
+        done <<<"$findings"
+
+        info "(Stock WireGuard, /etc/wireguard/, wg-quick@*, and any other VPNs will NOT be touched.)"
+
+        if [ "${AMNEZIA_FORCE_CLEANUP:-0}" = "1" ]; then
+            cleanup_existing_awg
+            return 0
+        fi
+        if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ]; then
+            warn "Non-interactive mode and AMNEZIA_FORCE_CLEANUP not set; aborting to avoid stomping."
+            die "Set AMNEZIA_FORCE_CLEANUP=1 to auto-clean, or run '$0 uninstall --purge' first."
+        fi
+
+        # Interactive: hand off to the menu. It either calls back to the caller
+        # (return 0 == "user picked Reinstall, please clean up") or exits the
+        # script outright on Uninstall / Exit / etc.
+        if existing_install_menu; then
+            cleanup_existing_awg
+        else
+            # The menu indicated "user is done with this run, do not reinstall".
+            exit 0
+        fi
+        return 0
+    fi
+
+    preserved=$(detect_preserved_awg || true)
+    [ -z "$preserved" ] && return 0
+
+    warn "Preserved AmneziaWG files were found, but no active awg0 installation was detected:"
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         printf '  - %s\n' "$line" >&2
-    done <<<"$findings"
+    done <<<"$preserved"
 
-    info "(Stock WireGuard, /etc/wireguard/, wg-quick@*, and any other VPNs will NOT be touched.)"
+    REINSTALL_FROM_PRESERVED=1
+    if [ -r "$META_FILE" ]; then
+        info "Reinstall prompts will default to the saved values in $META_FILE."
+    else
+        warn "No readable $META_FILE was found; only built-in/environment defaults are available."
+    fi
 
-    if [ "${AMNEZIA_FORCE_CLEANUP:-0}" = "1" ]; then
-        cleanup_existing_awg
+    if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
+        info "Proceeding with reinstall from preserved files in non-interactive mode."
         return 0
     fi
-    if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ]; then
-        warn "Non-interactive mode and AMNEZIA_FORCE_CLEANUP not set; aborting to avoid stomping."
-        die "Set AMNEZIA_FORCE_CLEANUP=1 to auto-clean, or run '$0 uninstall --purge' first."
-    fi
 
-    # Interactive: hand off to the menu. It either calls back to the caller
-    # (return 0 == "user picked Reinstall, please clean up") or exits the
-    # script outright on Uninstall / Exit / etc.
-    if existing_install_menu; then
-        cleanup_existing_awg
-    else
-        # The menu indicated "user is done with this run, do not reinstall".
-        exit 0
-    fi
+    ask_yn "Reinstall AmneziaWG using the preserved settings/configs?" "y" \
+        || die "Aborted by user. Use '$0 uninstall --purge' to remove preserved files."
 }
 
 # ---------------------------------------------------------------------------
@@ -1176,11 +1215,23 @@ EOF
 # AmneziaWG server config
 # ---------------------------------------------------------------------------
 generate_server_config() {
-    local server_priv server_pub
-    log "Generating server keypair..."
+    local server_priv server_pub preserved_peers=""
     install -d -m 0700 "$AWG_DIR"
-    server_priv=$(awg genkey)
-    server_pub=$(printf '%s' "$server_priv" | awg pubkey)
+
+    if [ "${REINSTALL_FROM_PRESERVED:-0}" = "1" ] && [ -r "$AWG_DIR/server.key" ]; then
+        log "Reusing preserved server keypair..."
+        server_priv=$(cat "$AWG_DIR/server.key")
+        server_pub=$(printf '%s' "$server_priv" | awg pubkey)
+    else
+        log "Generating server keypair..."
+        server_priv=$(awg genkey)
+        server_pub=$(printf '%s' "$server_priv" | awg pubkey)
+    fi
+
+    if [ "${REINSTALL_FROM_PRESERVED:-0}" = "1" ] && [ -r "$AWG_CONF" ]; then
+        preserved_peers=$(awk '/^# BEGIN_PEER /{keep=1} keep{print} /^# END_PEER /{keep=0}' "$AWG_CONF")
+    fi
+
     printf '%s' "$server_priv" >"$AWG_DIR/server.key"
     printf '%s' "$server_pub"  >"$AWG_DIR/server.pub"
     chmod 600 "$AWG_DIR/server.key"
@@ -1212,6 +1263,9 @@ generate_server_config() {
         fi
         echo "PostUp = $HOOK_UP"
         echo "PostDown = $HOOK_DOWN"
+        if [ -n "$preserved_peers" ]; then
+            printf '\n%s\n' "$preserved_peers"
+        fi
     } >"$AWG_CONF"
     chmod 600 "$AWG_CONF"
 }
@@ -1258,6 +1312,40 @@ load_meta() {
     [ -r "$META_FILE" ] || die "No installation found at $META_FILE; run '$0 install' first."
     # shellcheck disable=SC1090
     . "$META_FILE"
+}
+
+load_install_defaults_from_meta() {
+    [ -r "$META_FILE" ] || return 1
+    # shellcheck disable=SC1090
+    . "$META_FILE" 2>/dev/null || return 1
+
+    SAVED_HOST="${HOST:-}"
+    SAVED_PORT="${PORT:-}"
+    SAVED_PORT_ALIASES="${PORT_ALIASES:-}"
+    SAVED_WAN="${WAN:-}"
+    SAVED_NET4="${NET4:-}"
+    SAVED_NET6="${NET6:-}"
+    SAVED_NET4_PREFIX="${NET4_PREFIX:-}"
+    SAVED_NET6_PREFIX="${NET6_PREFIX:-}"
+    SAVED_SERVER_IP4="${SERVER_IP4:-}"
+    SAVED_SERVER_IP6="${SERVER_IP6:-}"
+    SAVED_DNS="${DNS:-}"
+    SAVED_MTU="${MTU:-}"
+    SAVED_ENABLE_IPV6="${ENABLE_IPV6:-}"
+    SAVED_OBFUSCATION="${OBFUSCATION:-}"
+    SAVED_JC="${JC:-}"
+    SAVED_JMIN="${JMIN:-}"
+    SAVED_JMAX="${JMAX:-}"
+    SAVED_S1="${S1:-}"
+    SAVED_S2="${S2:-}"
+    SAVED_H1="${H1:-}"
+    SAVED_H2="${H2:-}"
+    SAVED_H3="${H3:-}"
+    SAVED_H4="${H4:-}"
+    SAVED_MANAGE_IPTABLES="${MANAGE_IPTABLES:-}"
+    SAVED_ENABLE_UPNP="${ENABLE_UPNP:-}"
+    SAVED_UPNP_ROOT_URL="${UPNP_ROOT_URL:-}"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -2448,8 +2536,13 @@ uninstall() {
 # Interactive install flow
 # ---------------------------------------------------------------------------
 prompt_obfuscation() {
-    local choice
-    choice=$(ask_choice "Select obfuscation profile:" 2 \
+    local default_profile="${1:-standard}" default_idx=2 choice
+    case "$default_profile" in
+        off) default_idx=1 ;;
+        standard) default_idx=2 ;;
+        aggressive) default_idx=3 ;;
+    esac
+    choice=$(ask_choice "Select obfuscation profile:" "$default_idx" \
         "off          (plain WireGuard handshake — minimal CPU, no DPI evasion)" \
         "standard    (junk packets + randomised handshake magic — recommended)" \
         "aggressive  (heavy junk + padded handshake — best vs DPI, slightly higher overhead)")
@@ -2511,18 +2604,21 @@ do_install() {
     info "Detected OS: $PRETTY_NAME"
 
     maybe_cleanup_existing
+    load_install_defaults_from_meta || true
 
     # ---- gather inputs ------------------------------------------------------
-    local detected_ip4 detected_ip6 default_host wan
+    local detected_ip4 detected_ip6 default_host wan saved_ports
     detected_ip4=$(detect_public_ip4 || true)
     detected_ip6=$(detect_public_ip6 || true)
-    default_host="${AMNEZIA_HOST:-${detected_ip4:-${detected_ip6:-}}}"
+    saved_ports="${SAVED_PORT:-}"
+    [ -n "${SAVED_PORT_ALIASES:-}" ] && saved_ports+="${saved_ports:+,}${SAVED_PORT_ALIASES}"
+    default_host="${AMNEZIA_HOST:-${SAVED_HOST:-${detected_ip4:-${detected_ip6:-}}}}"
 
     HOST=$(ask "Public IP or DNS name clients should connect to" "$default_host")
     [ -n "$HOST" ] || die "Public host is required."
 
     # ----- Port(s) -----------------------------------------------------------
-    local suggested_port="${AMNEZIA_PORT:-$(suggest_port)}"
+    local suggested_port="${AMNEZIA_PORT:-${saved_ports:-$(suggest_port)}}"
     info "Tip: ports 80, 443 (UDP) get less DPI scrutiny on hostile networks."
     info "You may enter multiple ports separated by commas (e.g. 51820,443)."
     info "AWG listens on the first; the rest are iptables DNAT aliases (clients"
@@ -2554,46 +2650,64 @@ do_install() {
 
     # ----- IPv6 --------------------------------------------------------------
     local v6_default="auto"
-    case "${AMNEZIA_ENABLE_IPV6:-auto}" in
-        yes) ENABLE_IPV6=1 ;;
-        no)  ENABLE_IPV6=0 ;;
-        *)
-            if has_global_ipv6; then
-                v6_default="y"
-            else
-                v6_default="n"
-                info "No global IPv6 detected on this host."
-            fi
-            if ask_yn "Enable IPv6 inside the VPN?" "$v6_default"; then
-                ENABLE_IPV6=1
-            else
-                ENABLE_IPV6=0
-            fi
-            ;;
-    esac
+    if [ -n "${AMNEZIA_ENABLE_IPV6:-}" ]; then
+        case "$AMNEZIA_ENABLE_IPV6" in
+            yes|1) ENABLE_IPV6=1 ;;
+            no|0)  ENABLE_IPV6=0 ;;
+            *) die "AMNEZIA_ENABLE_IPV6 must be yes/no, 1/0, or unset for auto." ;;
+        esac
+    else
+        case "${SAVED_ENABLE_IPV6:-auto}" in
+            yes|1) v6_default="y" ;;
+            no|0)  v6_default="n" ;;
+            *)
+                if has_global_ipv6; then
+                    v6_default="y"
+                else
+                    v6_default="n"
+                    info "No global IPv6 detected on this host."
+                fi
+                ;;
+        esac
+        if ask_yn "Enable IPv6 inside the VPN?" "$v6_default"; then
+            ENABLE_IPV6=1
+        else
+            ENABLE_IPV6=0
+        fi
+    fi
 
     # ----- Networks ----------------------------------------------------------
-    NET4="${AMNEZIA_NET4:-10.66.66.0/24}"
-    NET6="${AMNEZIA_NET6:-fd86:ea04:1115::/64}"
+    NET4="${AMNEZIA_NET4:-${SAVED_NET4:-10.66.66.0/24}}"
+    NET6="${AMNEZIA_NET6:-${SAVED_NET6:-fd86:ea04:1115::/64}}"
     NET4_PREFIX=$(cidr_prefix "$NET4")
     NET6_PREFIX=$(cidr_prefix "$NET6")
     SERVER_IP4=$(cidr_address "$NET4" 1)
     SERVER_IP6=$(cidr6_address "$NET6" 1)
-    DNS="${AMNEZIA_DNS:-1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001}"
-    MTU="${AMNEZIA_MTU:-1280}"
+    DNS="${AMNEZIA_DNS:-${SAVED_DNS:-1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001}}"
+    MTU="${AMNEZIA_MTU:-${SAVED_MTU:-1280}}"
 
     # ----- Obfuscation -------------------------------------------------------
     if [ -n "${AMNEZIA_OBFUSCATION:-}" ]; then
         OBFUSCATION="$AMNEZIA_OBFUSCATION"
+        apply_obfuscation_preset "$OBFUSCATION"
+    elif [ -n "${SAVED_OBFUSCATION:-}" ]; then
+        OBFUSCATION=$(prompt_obfuscation "$SAVED_OBFUSCATION")
+        if [ "$OBFUSCATION" = "$SAVED_OBFUSCATION" ]; then
+            JC="${SAVED_JC:-0}"; JMIN="${SAVED_JMIN:-0}"; JMAX="${SAVED_JMAX:-0}"
+            S1="${SAVED_S1:-0}"; S2="${SAVED_S2:-0}"
+            H1="${SAVED_H1:-1}"; H2="${SAVED_H2:-2}"; H3="${SAVED_H3:-3}"; H4="${SAVED_H4:-4}"
+        else
+            apply_obfuscation_preset "$OBFUSCATION"
+        fi
     else
         OBFUSCATION=$(prompt_obfuscation)
+        apply_obfuscation_preset "$OBFUSCATION"
     fi
-    apply_obfuscation_preset "$OBFUSCATION"
 
     # ----- WAN iface ---------------------------------------------------------
     wan=$(detect_default_iface || true)
     [ -n "$wan" ] || wan="eth0"
-    wan=$(ask "Egress (WAN) interface for NAT" "$wan")
+    wan=$(ask "Egress (WAN) interface for NAT" "${AMNEZIA_WAN:-${SAVED_WAN:-$wan}}")
     ip link show "$wan" >/dev/null 2>&1 \
         || warn "Interface '$wan' not found right now; will be used at service start."
     # Export WAN to global so save_meta and apply_iptables_rules can use it.
@@ -2603,31 +2717,37 @@ do_install() {
     # Optional because UPnP exposes ports on the edge router and many operators
     # prefer explicit router/cloud-firewall rules. Default is intentionally "n".
     ENABLE_UPNP=0
-    case "${AMNEZIA_ENABLE_UPNP:-}" in
-        1|y|Y|yes|YES|true|TRUE)
-            ENABLE_UPNP=1
-            info "UPnP: miniupnpc/upnpc will forward all VPN UDP ports."
-            ;;
-        0|n|N|no|NO|false|FALSE)
-            ENABLE_UPNP=0
-            ;;
-        "")
-            if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
-                ENABLE_UPNP=0
-            else
-                warn "UPnP can automatically open ports on your router; enable it only on a trusted LAN/router."
-                if ask_yn "Forward VPN UDP port(s) on your router with UPnP?" "n"; then
-                    ENABLE_UPNP=1
-                fi
+    if [ -n "${AMNEZIA_ENABLE_UPNP:-}" ]; then
+        case "$AMNEZIA_ENABLE_UPNP" in
+            1|y|Y|yes|YES|true|TRUE) ENABLE_UPNP=1 ;;
+            0|n|N|no|NO|false|FALSE) ENABLE_UPNP=0 ;;
+            *) die "AMNEZIA_ENABLE_UPNP must be 1/0, yes/no, or true/false." ;;
+        esac
+    else
+        local _upnp_default="n"
+        case "${SAVED_ENABLE_UPNP:-}" in
+            1|y|Y|yes|YES|true|TRUE) _upnp_default="y" ;;
+            0|n|N|no|NO|false|FALSE|"") _upnp_default="n" ;;
+            *) die "Saved ENABLE_UPNP in $META_FILE must be 1/0, yes/no, or true/false." ;;
+        esac
+        if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
+            [ "$_upnp_default" = "y" ] && ENABLE_UPNP=1 || ENABLE_UPNP=0
+        else
+            warn "UPnP can automatically open ports on your router; enable it only on a trusted LAN/router."
+            if ask_yn "Forward VPN UDP port(s) on your router with UPnP?" "$_upnp_default"; then
+                ENABLE_UPNP=1
             fi
-            ;;
-        *) die "AMNEZIA_ENABLE_UPNP must be 1/0, yes/no, or true/false." ;;
-    esac
-    if [ "$ENABLE_UPNP" = "1" ] && [ -n "${AMNEZIA_UPNP_ROOT_URL:-}" ]; then
-        valid_upnp_root_url "$AMNEZIA_UPNP_ROOT_URL" \
-            || die "AMNEZIA_UPNP_ROOT_URL must look like $UPNP_ROOT_URL_EXAMPLE"
-        UPNP_ROOT_URL="$AMNEZIA_UPNP_ROOT_URL"
-        info "UPnP: using configured IGD root URL: $UPNP_ROOT_URL"
+        fi
+    fi
+    [ "$ENABLE_UPNP" = "1" ] && info "UPnP: miniupnpc/upnpc will forward all VPN UDP ports."
+    if [ "$ENABLE_UPNP" = "1" ]; then
+        local _upnp_root_default="${AMNEZIA_UPNP_ROOT_URL:-${SAVED_UPNP_ROOT_URL:-}}"
+        if [ -n "$_upnp_root_default" ]; then
+            valid_upnp_root_url "$_upnp_root_default" \
+                || die "AMNEZIA_UPNP_ROOT_URL must look like $UPNP_ROOT_URL_EXAMPLE"
+            UPNP_ROOT_URL="$_upnp_root_default"
+            info "UPnP: using configured IGD root URL: $UPNP_ROOT_URL"
+        fi
     fi
 
     # ----- iptables management -----------------------------------------------
@@ -2640,12 +2760,14 @@ do_install() {
             local _ipt_prompt="Add iptables rules: INPUT UDP :$PORT"
             [ -n "$PORT_ALIASES" ] && _ipt_prompt+=", DNAT aliases ($PORT_ALIASES → $PORT)"
             _ipt_prompt+=", FORWARD $IFACE ↔ $wan"
+            local _ipt_default="y"
+            [ "${SAVED_MANAGE_IPTABLES:-}" = "0" ] && _ipt_default="n"
             if [ "${AMNEZIA_MANAGE_IPTABLES:-}" = "1" ] \
                 || [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ] \
                 || [ ! -t 0 ]; then
-                MANAGE_IPTABLES=1
-                info "iptables: rules will be configured automatically."
-            elif ask_yn "$_ipt_prompt?" "y"; then
+                [ "${AMNEZIA_MANAGE_IPTABLES:-$_ipt_default}" = "1" ] || [ "$_ipt_default" = "y" ] && MANAGE_IPTABLES=1 || MANAGE_IPTABLES=0
+                [ "$MANAGE_IPTABLES" = "1" ] && info "iptables: rules will be configured automatically."
+            elif ask_yn "$_ipt_prompt?" "$_ipt_default"; then
                 MANAGE_IPTABLES=1
             else
                 info "Skipping iptables management. Ensure port $PORT is reachable."
@@ -2658,7 +2780,12 @@ do_install() {
     # end; the rest are saved for later retrieval via the 'show-client'
     # subcommand or directly from /var/lib/amnezia-installer/clients/.
     CLIENTS_CSV="${AMNEZIA_CLIENT_NAME:-client1}"
-    CLIENTS_CSV=$(ask "Initial client name(s) — comma-separated (e.g. 'maciej,alice,bob')" "$CLIENTS_CSV")
+    local _client_prompt="Initial client name(s) — comma-separated (e.g. 'maciej,alice,bob')"
+    if [ "${REINSTALL_FROM_PRESERVED:-0}" = "1" ] && [ -z "${AMNEZIA_CLIENT_NAME:-}" ]; then
+        CLIENTS_CSV=""
+        _client_prompt="Additional client name(s) — comma-separated, or leave empty to keep existing clients only"
+    fi
+    CLIENTS_CSV=$(ask "$_client_prompt" "$CLIENTS_CSV")
     # Validate every name up-front, AND require at least one survives trimming,
     # so an input like ", ," or "" can't slip past this gate and only fail
     # halfway through the install (after packages + service start).
@@ -2673,11 +2800,17 @@ do_install() {
         _valid_count=$((_valid_count + 1))
     done
     unset _check_names
-    [ "$_valid_count" -gt 0 ] \
-        || die "Need at least one client name; got '$CLIENTS_CSV' which trims to nothing."
+    if [ "$_valid_count" -eq 0 ]; then
+        if [ "${REINSTALL_FROM_PRESERVED:-0}" = "1" ]; then
+            info "No additional initial clients requested; preserved clients (if any) will remain in $AWG_CONF."
+        else
+            die "Need at least one client name; got '$CLIENTS_CSV' which trims to nothing."
+        fi
+    fi
 
     # ---- summary ------------------------------------------------------------
-    local _port_summary="${HOST}:${PORT}/udp"
+    local _port_summary="${HOST}:${PORT}/udp" _clients_summary="${CLIENTS_CSV}"
+    [ -z "$_clients_summary" ] && _clients_summary="none (preserved clients only)"
     [ -n "$PORT_ALIASES" ] && _port_summary+=" (+ aliases: ${PORT_ALIASES//,/ })"
     local _ipt_summary="skipped"
     [ "$MANAGE_IPTABLES" = "1" ] && _ipt_summary="INPUT :$PORT, FORWARD $IFACE↔$wan"
@@ -2698,7 +2831,7 @@ ${C_BOLD}Installation summary${C_RST}
   Obfuscation     : ${OBFUSCATION}$([ "$OBFUSCATION" != "off" ] && printf ' (Jc=%s Jmin=%s Jmax=%s S1=%s S2=%s)' "$JC" "$JMIN" "$JMAX" "$S1" "$S2")
   iptables rules  : ${_ipt_summary}
   UPnP forwarding : ${_upnp_summary}
-  Initial clients : ${CLIENTS_CSV}
+  Initial clients : ${_clients_summary}
 
 EOF
     ask_yn "Proceed?" "y" || die "Aborted by user."
@@ -2727,9 +2860,13 @@ EOF
 
     # ---- initial client roster ---------------------------------------------
     # All clients in the CSV are configured; only the FIRST is shown + QR'd.
-    log "Creating initial client(s): ${CLIENTS_CSV}"
-    local first_conf
-    first_conf=$(add_clients_from_csv "$CLIENTS_CSV")
+    local first_conf=""
+    if [ "$_valid_count" -gt 0 ]; then
+        log "Creating initial client(s): ${CLIENTS_CSV}"
+        first_conf=$(add_clients_from_csv "$CLIENTS_CSV")
+    else
+        info "Skipping initial client creation."
+    fi
 
     # ---- stage a copy of ourselves for later subcommands & self-update ------
     install_self_to_state
