@@ -77,7 +77,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.2.2"
+readonly SCRIPT_VERSION="1.3.0"
 readonly SCRIPT_NAME="amnezia-installer"
 readonly IFACE="awg0"
 readonly SVC="awg-quick@${IFACE}.service"
@@ -1216,6 +1216,378 @@ show_client_payload() {
 }
 
 # ---------------------------------------------------------------------------
+# Doctor: runtime health diagnostics
+# ---------------------------------------------------------------------------
+_doc_pass() { printf '%s[+]%s %-52s %s\n' "$C_GRN" "$C_RST" "$1" "${2:-}"; }
+_doc_warn_line() { printf '%s[!]%s %-52s %s\n' "$C_YLW" "$C_RST" "$1" "${2:-}"; }
+_doc_fail_line() { printf '%s[x]%s %-52s %s\n' "$C_RED" "$C_RST" "$1" "${2:-}"; }
+_doc_hint()  { printf '       %s\n' "$*"; }
+
+# Returns 0 if an ACCEPT rule covering UDP $port exists in INPUT for the given
+# iptables command (iptables or ip6tables). Handles both --dport and --dports
+# (multiport) format as shown by `iptables -L INPUT -n`.
+_ipt_input_allows_port() {
+    local cmd="$1" port="$2"
+    "$cmd" -L INPUT -n 2>/dev/null \
+        | grep -E '^ACCEPT[[:space:]]' \
+        | grep -E 'udp|all' \
+        | grep -qE "(^|[^0-9])${port}([^0-9]|$)"
+}
+
+do_doctor() {
+    local _errs=0 _warns=0
+    need_root
+
+    # Load meta variables if available; leave empty so the checks that need
+    # them degrade gracefully on a partial or uninstalled state.
+    local HOST="" PORT="" NET4="" NET6="" NET4_PREFIX="" NET6_PREFIX=""
+    local SERVER_IP4="" SERVER_IP6="" DNS="" MTU="" ENABLE_IPV6="0"
+    local OBFUSCATION="off" JC=0 JMIN=0 JMAX=0 S1=0 S2=0 H1=1 H2=2 H3=3 H4=4
+    if [ -r "$META_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$META_FILE" 2>/dev/null || true
+    fi
+
+    printf '\n%s%sAmneziaWG Doctor%s%s\n\n' \
+        "$C_BOLD" "$C_BLU" \
+        "${HOST:+ — ${HOST}:${PORT}/udp}" "$C_RST"
+
+    # ── 1. Kernel module ────────────────────────────────────────────────────
+    if lsmod 2>/dev/null | grep -q '^amneziawg[[:space:]]'; then
+        _doc_pass "kernel module" "amneziawg loaded"
+    else
+        _doc_fail_line "kernel module" "amneziawg NOT in lsmod — module failed to load"
+        _doc_hint "Try: modprobe amneziawg"
+        _doc_hint "Or reinstall the amneziawg package and check dkms status."
+        _errs=$((_errs+1))
+    fi
+
+    # ── 2. Binaries ─────────────────────────────────────────────────────────
+    if command -v awg >/dev/null 2>&1; then
+        local _awg_ver; _awg_ver=$(awg --version 2>/dev/null | head -n1 || echo "present")
+        _doc_pass "awg binary" "$_awg_ver"
+    else
+        _doc_fail_line "awg binary" "not found in PATH — package not installed?"
+        _errs=$((_errs+1))
+    fi
+    if command -v awg-quick >/dev/null 2>&1; then
+        _doc_pass "awg-quick binary" "found"
+    else
+        _doc_fail_line "awg-quick binary" "not found in PATH"
+        _errs=$((_errs+1))
+    fi
+
+    # ── 3. Config and hook scripts ──────────────────────────────────────────
+    if [ -f "$AWG_CONF" ] && [ -r "$AWG_CONF" ]; then
+        _doc_pass "server config" "$AWG_CONF (readable)"
+    else
+        _doc_fail_line "server config" "$AWG_CONF: missing or unreadable"
+        _errs=$((_errs+1))
+    fi
+
+    local _hooks_ok=1
+    for _hf in "$HOOK_UP" "$HOOK_DOWN"; do
+        if [ ! -f "$_hf" ]; then
+            _doc_fail_line "hook script" "$(basename "$_hf"): missing"
+            _hooks_ok=0; _errs=$((_errs+1))
+        elif [ ! -x "$_hf" ]; then
+            _doc_fail_line "hook script" "$(basename "$_hf"): not executable"
+            _hooks_ok=0; _errs=$((_errs+1))
+        fi
+    done
+    [ "$_hooks_ok" = "1" ] && _doc_pass "hook scripts" "up + down exist and are executable"
+
+    # ── 4. Service status ────────────────────────────────────────────────────
+    if systemctl is-active --quiet "$SVC" 2>/dev/null; then
+        _doc_pass "service" "$SVC active"
+    else
+        local _sstate; _sstate=$(systemctl is-active "$SVC" 2>/dev/null || echo "unknown")
+        _doc_fail_line "service" "$SVC is ${_sstate} (not active)"
+        _doc_hint "Check: journalctl -u $SVC -n 40 --no-pager"
+        _errs=$((_errs+1))
+    fi
+
+    # ── 5. Journal errors ────────────────────────────────────────────────────
+    local _jerr
+    _jerr=$(journalctl -u "$SVC" -n 100 --no-pager 2>/dev/null \
+        | grep -iE '\b(error|failed|fatal|assert|denied)\b' \
+        | grep -v "^--" | head -5 || true)
+    if [ -z "$_jerr" ]; then
+        _doc_pass "journal" "no errors/failures in last 100 lines"
+    else
+        _doc_warn_line "journal" "errors found in service log:"
+        while IFS= read -r _jl; do _doc_hint "$_jl"; done <<<"$_jerr"
+        _warns=$((_warns+1))
+    fi
+
+    # ── 6. Interface ─────────────────────────────────────────────────────────
+    if ip link show "$IFACE" >/dev/null 2>&1; then
+        local _iaddrs; _iaddrs=$(ip -o addr show "$IFACE" 2>/dev/null \
+            | awk '{printf $4 " "}')
+        _doc_pass "interface" "$IFACE UP — ${_iaddrs:-no addresses assigned}"
+    else
+        _doc_fail_line "interface" "$IFACE does not exist — service may have failed to start"
+        _errs=$((_errs+1))
+    fi
+
+    # ── 7. Port listening ────────────────────────────────────────────────────
+    if [ -n "$PORT" ]; then
+        if ss -ulnp 2>/dev/null | grep -qE ":${PORT}[[:space:]]"; then
+            _doc_pass "port listening" "UDP :$PORT bound (0.0.0.0 + [::])"
+        else
+            _doc_fail_line "port listening" "UDP :$PORT NOT found in ss output"
+            _doc_hint "Check: ss -ulnp"
+            _errs=$((_errs+1))
+        fi
+    else
+        _doc_warn_line "port" "unknown — meta file not loaded"
+        _warns=$((_warns+1))
+    fi
+
+    # ── 8. Peers ──────────────────────────────────────────────────────────────
+    local _pc=0 _pl=0
+    [ -f "$AWG_CONF" ] && _pc=$(grep -c '^\[Peer\]' "$AWG_CONF" 2>/dev/null || echo 0)
+    ip link show "$IFACE" >/dev/null 2>&1 \
+        && _pl=$(awg show "$IFACE" peers 2>/dev/null | wc -l || echo 0)
+    if [ "$_pc" -gt 0 ]; then
+        _doc_pass "peers" "${_pc} in config, ${_pl} in live interface"
+    else
+        _doc_warn_line "peers" "no peers in config — add one: sudo $SCRIPT_NAME add-client <name>"
+        _warns=$((_warns+1))
+    fi
+
+    # ── 9. sysctl ─────────────────────────────────────────────────────────────
+    local _f4; _f4=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+    local _svm; _svm=$(sysctl -n net.ipv4.conf.all.src_valid_mark 2>/dev/null || echo 0)
+    local _f6; _f6=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)
+    local _sctl_ok=1 _sctl_bad=""
+    [ "$_f4"  != "1" ] && { _sctl_ok=0; _sctl_bad+=" ipv4_forward=$_f4"; }
+    [ "$_svm" != "1" ] && { _sctl_ok=0; _sctl_bad+=" src_valid_mark=$_svm"; }
+    [ "$ENABLE_IPV6" = "1" ] && [ "$_f6" != "1" ] \
+        && { _sctl_ok=0; _sctl_bad+=" ipv6_forward=$_f6"; }
+    if [ "$_sctl_ok" = "1" ]; then
+        local _s6note=""; [ "$ENABLE_IPV6" = "1" ] && _s6note=" ipv6_forward=1"
+        _doc_pass "sysctl" "ipv4_forward=1 src_valid_mark=1${_s6note}"
+    else
+        _doc_fail_line "sysctl" "wrong values:${_sctl_bad}"
+        _doc_hint "Fix: sysctl -w net.ipv4.ip_forward=1 net.ipv4.conf.all.src_valid_mark=1"
+        _errs=$((_errs+1))
+    fi
+
+    # ── 10. nftables amnezia tables ───────────────────────────────────────────
+    local _nft_ok=1 _nft_missing=""
+    nft list table inet "$NFT_T_FWD"  >/dev/null 2>&1 || { _nft_ok=0; _nft_missing+=" $NFT_T_FWD"; }
+    nft list table ip   "$NFT_T_NAT4" >/dev/null 2>&1 || { _nft_ok=0; _nft_missing+=" $NFT_T_NAT4"; }
+    if [ "$ENABLE_IPV6" = "1" ]; then
+        nft list table ip6 "$NFT_T_NAT6" >/dev/null 2>&1 \
+            || { _nft_ok=0; _nft_missing+=" $NFT_T_NAT6"; }
+    fi
+    if [ "$_nft_ok" = "1" ]; then
+        local _nft_desc="${NFT_T_FWD}, ${NFT_T_NAT4}"
+        [ "$ENABLE_IPV6" = "1" ] && _nft_desc+=", ${NFT_T_NAT6}"
+        _doc_pass "nftables" "${_nft_desc} loaded"
+    else
+        _doc_fail_line "nftables" "missing tables:${_nft_missing}"
+        _doc_hint "Restart service: systemctl restart $SVC"
+        _errs=$((_errs+1))
+    fi
+
+    # ── 11. iptables INPUT – VPN listen port ──────────────────────────────────
+    if [ -n "$PORT" ] && command -v iptables >/dev/null 2>&1; then
+        local _ipt_pol
+        _ipt_pol=$(iptables -L INPUT -n 2>/dev/null | sed -n '1s/.*policy \([A-Z]*\).*/\1/p')
+        if [ "$_ipt_pol" = "ACCEPT" ]; then
+            _doc_pass "iptables INPUT" "policy ACCEPT — all ports reachable"
+        elif _ipt_input_allows_port iptables "$PORT"; then
+            _doc_pass "iptables INPUT" "policy ${_ipt_pol}, UDP :$PORT has ACCEPT rule"
+        else
+            _doc_fail_line "iptables INPUT" \
+                "policy ${_ipt_pol}, no ACCEPT for UDP :$PORT — handshake blocked"
+            _doc_hint "Fix: iptables -I INPUT -p udp --dport $PORT -j ACCEPT"
+            _doc_hint "     Persist: netfilter-persistent save"
+            _doc_hint "           OR: iptables-save > /etc/iptables/rules.v4"
+            _errs=$((_errs+1))
+        fi
+    fi
+
+    # ── 12. ip6tables INPUT ───────────────────────────────────────────────────
+    if [ "$ENABLE_IPV6" = "1" ] && [ -n "$PORT" ] \
+        && command -v ip6tables >/dev/null 2>&1; then
+        local _ip6t_pol
+        _ip6t_pol=$(ip6tables -L INPUT -n 2>/dev/null | sed -n '1s/.*policy \([A-Z]*\).*/\1/p')
+        if [ "$_ip6t_pol" = "ACCEPT" ]; then
+            _doc_pass "ip6tables INPUT" "policy ACCEPT"
+        elif _ipt_input_allows_port ip6tables "$PORT"; then
+            _doc_pass "ip6tables INPUT" "policy ${_ip6t_pol}, UDP :$PORT has ACCEPT rule"
+        else
+            _doc_fail_line "ip6tables INPUT" \
+                "policy ${_ip6t_pol}, no ACCEPT for UDP :$PORT"
+            _doc_hint "Fix: ip6tables -I INPUT -p udp --dport $PORT -j ACCEPT"
+            _errs=$((_errs+1))
+        fi
+    fi
+
+    # ── 13. iptables FORWARD – VPN subnet forwarding ──────────────────────────
+    if [ -n "$NET4" ] && command -v iptables >/dev/null 2>&1; then
+        local _fwd_pol
+        _fwd_pol=$(iptables -L FORWARD -n 2>/dev/null | sed -n '1s/.*policy \([A-Z]*\).*/\1/p')
+        if [ "$_fwd_pol" = "ACCEPT" ]; then
+            _doc_pass "iptables FORWARD" "policy ACCEPT — forwarding unrestricted"
+        else
+            # Look for an ACCEPT rule covering the VPN subnet or our interface
+            # (excluding the RELATED,ESTABLISHED rule which only handles returns).
+            local _fwd_ok
+            _fwd_ok=$(iptables -L FORWARD -n 2>/dev/null \
+                | grep -E '^ACCEPT' \
+                | grep -Ev 'RELATED,ESTABLISHED|ctstate' \
+                | grep -E "(${NET4//./\\.}|[[:space:]]${IFACE}[[:space:]])" \
+                || true)
+            if [ -n "$_fwd_ok" ]; then
+                _doc_pass "iptables FORWARD" "policy ${_fwd_pol}, ACCEPT rule covers $NET4"
+            else
+                _doc_warn_line "iptables FORWARD" \
+                    "policy ${_fwd_pol}, no explicit ACCEPT for $NET4"
+                _doc_hint "nftables amnezia_fwd may handle this depending on hook priority."
+                _doc_hint "If internet access from VPN clients fails after fixing INPUT:"
+                _doc_hint "  iptables -I FORWARD -s $NET4 -j ACCEPT"
+                _doc_hint "  iptables -I FORWARD -d $NET4 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+                _warns=$((_warns+1))
+            fi
+        fi
+    fi
+
+    # ── 14. ufw ───────────────────────────────────────────────────────────────
+    if command -v ufw >/dev/null 2>&1; then
+        local _ufw_st; _ufw_st=$(ufw status 2>/dev/null | head -1 || echo "unknown")
+        if echo "$_ufw_st" | grep -qi "inactive"; then
+            _doc_pass "ufw" "inactive"
+        else
+            local _ufw_rule
+            _ufw_rule=$(ufw status 2>/dev/null | grep -E "^${PORT:-0}[[:space:]]" || true)
+            if [ -n "$_ufw_rule" ]; then
+                _doc_pass "ufw" "active, port $PORT allowed"
+            else
+                _doc_fail_line "ufw" "active, no rule found for UDP :$PORT"
+                _doc_hint "Fix: ufw allow $PORT/udp"
+                _errs=$((_errs+1))
+            fi
+        fi
+    fi
+
+    # ── 15. firewalld ─────────────────────────────────────────────────────────
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+            local _fwz; _fwz=$(firewall-cmd --get-default-zone 2>/dev/null || echo "public")
+            local _fwp
+            _fwp=$(firewall-cmd --list-ports --zone="$_fwz" 2>/dev/null \
+                | grep -E "(^| )${PORT:-0}/(udp|tcp)" || true)
+            if [ -n "$_fwp" ]; then
+                _doc_pass "firewalld" "active, port $PORT open in zone ${_fwz}"
+            else
+                _doc_fail_line "firewalld" "active, port $PORT NOT open in zone ${_fwz}"
+                _doc_hint "Fix: firewall-cmd --permanent --add-port=$PORT/udp && firewall-cmd --reload"
+                _errs=$((_errs+1))
+            fi
+        else
+            _doc_pass "firewalld" "not active"
+        fi
+    fi
+
+    # ── 16. Hostname resolution ───────────────────────────────────────────────
+    if [ -n "$HOST" ]; then
+        local _resolved
+        _resolved=$(getent hosts "$HOST" 2>/dev/null | awk '{print $1}' | head -1 || true)
+        if [ -n "$_resolved" ]; then
+            _doc_pass "hostname" "$HOST → $_resolved"
+        elif [[ "$HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || [[ "$HOST" == *:*:* ]]; then
+            _doc_pass "hostname" "$HOST (IP literal, no DNS needed)"
+        else
+            _doc_warn_line "hostname" "$HOST does not resolve from this server"
+            _doc_hint "Clients may fail to connect. Check DNS propagation."
+            _warns=$((_warns+1))
+        fi
+    fi
+
+    # ── 17. Meta file ─────────────────────────────────────────────────────────
+    if [ -r "$META_FILE" ]; then
+        _doc_pass "meta file" "$META_FILE"
+    else
+        _doc_warn_line "meta file" "$META_FILE missing — client subcommands need it"
+        _warns=$((_warns+1))
+    fi
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    echo
+    if [ "$_errs" -gt 0 ]; then
+        printf '%s%s[FAIL] Doctor: %d error(s), %d warning(s). VPN likely NOT functional.%s\n' \
+            "$C_RED" "$C_BOLD" "$_errs" "$_warns" "$C_RST" >&2
+        return 1
+    elif [ "$_warns" -gt 0 ]; then
+        printf '%s%s[WARN] Doctor: 0 errors, %d warning(s). VPN may have limited functionality.%s\n' \
+            "$C_YLW" "$C_BOLD" "$_warns" "$C_RST"
+        return 0
+    else
+        printf '%s%s[ OK ] Doctor: all checks passed. VPN should be functional.%s\n' \
+            "$C_GRN" "$C_BOLD" "$C_RST"
+        return 0
+    fi
+}
+
+# _offer_iptables_fix: called from do_install after doctor reports INPUT errors.
+# Interactively offers to insert an iptables ACCEPT rule for the VPN port.
+# Non-interactive and AMNEZIA_NONINTERACTIVE=1 modes only print the command.
+_offer_iptables_fix() {
+    local port="$1" enable_ipv6="$2"
+    [ -n "$port" ] || return 0
+    command -v iptables >/dev/null 2>&1 || return 0
+
+    local _ipt_pol
+    _ipt_pol=$(iptables -L INPUT -n 2>/dev/null | sed -n '1s/.*policy \([A-Z]*\).*/\1/p')
+    [ "$_ipt_pol" = "ACCEPT" ] && return 0
+    _ipt_input_allows_port iptables "$port" && return 0
+
+    # Port is blocked.
+    if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
+        warn "iptables INPUT blocks UDP :$port. Add this rule to fix it:"
+        warn "  iptables -I INPUT -p udp --dport $port -j ACCEPT"
+        return 0
+    fi
+
+    warn "iptables INPUT policy is DROP and port $port has no ACCEPT rule."
+    warn "This will prevent any client from completing a handshake."
+    if ask_yn "Add 'iptables -I INPUT -p udp --dport $port -j ACCEPT' now?" "y"; then
+        iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+        log "iptables rule added for UDP :$port."
+        warn "This rule is NOT persistent across reboots."
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            if ask_yn "Save with netfilter-persistent save?" "y"; then
+                netfilter-persistent save
+            fi
+        elif [ -f /etc/iptables/rules.v4 ]; then
+            if ask_yn "Save to /etc/iptables/rules.v4?" "y"; then
+                iptables-save > /etc/iptables/rules.v4
+            fi
+        else
+            warn "No iptables-persistent found. Save manually when ready:"
+            warn "  iptables-save > /etc/iptables/rules.v4"
+        fi
+    fi
+
+    # IPv6
+    if [ "$enable_ipv6" = "1" ] && command -v ip6tables >/dev/null 2>&1; then
+        local _ip6t_pol
+        _ip6t_pol=$(ip6tables -L INPUT -n 2>/dev/null | sed -n '1s/.*policy \([A-Z]*\).*/\1/p')
+        if [ "$_ip6t_pol" != "ACCEPT" ] && ! _ipt_input_allows_port ip6tables "$port"; then
+            if ask_yn "Also add ip6tables rule for UDP :$port?" "y"; then
+                ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT
+                log "ip6tables rule added for UDP :$port."
+            fi
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Status / uninstall
 # ---------------------------------------------------------------------------
 status() {
@@ -1457,9 +1829,19 @@ EOF
     # ---- stage a copy of ourselves for later subcommands & self-update ------
     install_self_to_state
 
-    cat <<EOF
+    # ---- pre-flight doctor check -------------------------------------------
+    # Offer to fix iptables INPUT before running the full check so that
+    # the doctor result reflects the post-fix state.
+    _offer_iptables_fix "$PORT" "$ENABLE_IPV6"
 
-${C_GRN}AmneziaWG server is up.${C_RST}
+    log "Running connectivity checks (doctor)..."
+    local _install_ok=0
+    do_doctor && _install_ok=1 || true
+
+    if [ "$_install_ok" = "1" ]; then
+        cat <<EOF
+
+${C_GRN}${C_BOLD}AmneziaWG server is up and all checks passed.${C_RST}
   Service       : ${SVC}  ($(systemctl is-active "$SVC"))
   Endpoint      : ${HOST}:${PORT}/udp
   Server pub    : ${SERVER_PUB}
@@ -1472,16 +1854,30 @@ Next steps:
   • To list clients:           sudo ${SCRIPT_NAME} list-clients
   • To revoke a client:        sudo ${SCRIPT_NAME} remove-client <name>
   • To check status:           sudo ${SCRIPT_NAME} status
+  • To run health checks:      sudo ${SCRIPT_NAME} doctor
   • To force an update check:  sudo ${SCRIPT_NAME} self-update --force
   • To uninstall:              sudo ${SCRIPT_NAME} uninstall [--purge]
 EOF
 
-    # ---- render the FIRST client (config + QR) ------------------------------
-    if [ -n "$first_conf" ] && [ -f "$first_conf" ]; then
-        echo
-        info "Showing the first client only. The rest are saved as ${CLIENTS_DIR}/<host>-<name>.conf"
-        info "and can be re-rendered any time with: sudo ${SCRIPT_NAME} show-client <name>"
-        show_client_payload "$first_conf"
+        # ---- render the FIRST client (config + QR) -------------------------
+        if [ -n "$first_conf" ] && [ -f "$first_conf" ]; then
+            echo
+            info "Showing the first client only. The rest are saved as ${CLIENTS_DIR}/<host>-<name>.conf"
+            info "and can be re-rendered any time with: sudo ${SCRIPT_NAME} show-client <name>"
+            show_client_payload "$first_conf"
+        fi
+    else
+        cat <<EOF
+
+${C_YLW}${C_BOLD}AmneziaWG installed but doctor found connectivity issues (see above).${C_RST}
+  Service       : ${SVC}  ($(systemctl is-active "$SVC"))
+  Endpoint      : ${HOST}:${PORT}/udp
+  Clients dir   : ${CLIENTS_DIR}
+
+Fix the issues reported above, then run:
+  sudo ${SCRIPT_NAME} doctor          — re-run checks
+  sudo ${SCRIPT_NAME} show-client <name>  — print config + QR once everything is green
+EOF
     fi
 
     # ---- drop the user into a shell at the install dir so they can keep ----
@@ -1541,6 +1937,7 @@ Usage:
   sudo $0 list-clients
   sudo $0 show-client   <name>
   sudo $0 status
+  sudo $0 doctor                     # check service, port, firewall, sysctl, nftables, etc.
   sudo $0 self-update [--force]      # force a network check + re-exec
   sudo $0 version
   sudo $0 uninstall [--purge]
@@ -1561,10 +1958,10 @@ EOF
 main() {
     local cmd="${1:-install}"
 
-    # Skip the network call for read-only / destructive / help commands. For
-    # everything else, opportunistically self-update (cached for a day).
+    # Skip the network call for read-only / diagnostic / destructive / help
+    # commands. For everything else, opportunistically self-update (cached 24 h).
     case "$cmd" in
-        -h|--help|help|version|--version|uninstall|status|list-clients) ;;
+        -h|--help|help|version|--version|uninstall|status|list-clients|doctor) ;;
         *) self_update "$@" ;;
     esac
 
@@ -1610,6 +2007,10 @@ main() {
             ;;
         status)
             need_root; status
+            ;;
+        doctor)
+            need_root
+            _rc=0; do_doctor || _rc=$?; exit "$_rc"
             ;;
         uninstall)
             need_root; shift; uninstall "${1:-}"
