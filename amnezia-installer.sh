@@ -61,6 +61,9 @@
 #   AMNEZIA_ENABLE_UPNP=1|0      1 = install miniupnpc and keep UPnP UDP forwards
 #                                for all VPN ports refreshed by a systemd timer
 #                                (default: 0 / prompted as "n")
+#   AMNEZIA_UPNP_ROOT_URL=<url>  optional UPnP IGD XML root description URL
+#                                (e.g. http://192.168.1.1:5000/rootDesc.xml)
+#                                used with upnpc -u when SSDP discovery is flaky
 #   AMNEZIA_NO_UPDATE_CHECK=1    skip the on-startup self-update check
 #   AMNEZIA_FORCE_CLEANUP=1      auto-clean any existing AmneziaWG install before reinstalling
 #   AMNEZIA_NO_SHELL_DROP=1      do not exec $SHELL at /var/lib/amnezia-installer on completion
@@ -110,6 +113,7 @@ readonly NFT_T_NAT4="amnezia_nat4"
 readonly NFT_T_NAT6="amnezia_nat6"
 readonly UPDATE_URL="https://raw.githubusercontent.com/maciekish/amnezia-installer/main/amnezia-installer.sh"
 readonly UPDATE_CACHE_SECONDS=86400  # only hit the network once a day
+readonly UPNP_ROOT_URL_EXAMPLE="http://192.168.1.1:5000/rootDesc.xml"
 readonly UBUNTU_MOK_DIR="/var/lib/shim-signed/mok"
 readonly UBUNTU_MOK_DER="${UBUNTU_MOK_DIR}/MOK.der"
 readonly UBUNTU_MOK_PRIV="${UBUNTU_MOK_DIR}/MOK.priv"
@@ -152,6 +156,21 @@ ask() {
         read -r -p "$prompt: " reply || reply=""
     fi
     printf '%s' "${reply:-$default}"
+}
+
+ask_placeholder() {
+    # ask_placeholder "question" "placeholder" -> echoes the answer, or empty if skipped.
+    local prompt="$1" placeholder="${2-}" reply=""
+    if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
+        printf ''
+        return
+    fi
+    if [ -n "$placeholder" ]; then
+        read -r -p "$prompt [$placeholder]: " reply || reply=""
+    else
+        read -r -p "$prompt: " reply || reply=""
+    fi
+    printf '%s' "$reply"
 }
 
 ask_yn() {
@@ -1230,6 +1249,7 @@ H3="$H3"
 H4="$H4"
 MANAGE_IPTABLES="${MANAGE_IPTABLES:-0}"
 ENABLE_UPNP="${ENABLE_UPNP:-0}"
+UPNP_ROOT_URL="${UPNP_ROOT_URL:-}"
 EOF
     chmod 600 "$META_FILE"
 }
@@ -1573,7 +1593,7 @@ do_doctor() {
 
     # Load meta variables if available; leave empty so the checks that need
     # them degrade gracefully on a partial or uninstalled state.
-    local HOST="" PORT="" PORT_ALIASES="" WAN="" NET4="" NET6="" NET4_PREFIX="" NET6_PREFIX=""
+    local HOST="" PORT="" PORT_ALIASES="" WAN="" UPNP_ROOT_URL="" NET4="" NET6="" NET4_PREFIX="" NET6_PREFIX=""
     local SERVER_IP4="" SERVER_IP6="" DNS="" MTU="" ENABLE_IPV6="0"
     local OBFUSCATION="off" JC=0 JMIN=0 JMAX=0 S1=0 S2=0 H1=1 H2=2 H3=3 H4=4
     local MANAGE_IPTABLES="0" ENABLE_UPNP="0"
@@ -1924,11 +1944,76 @@ do_doctor() {
 # ---------------------------------------------------------------------------
 # UPnP port forwarding lifecycle. Ubuntu ships the miniupnpc package, whose
 # upnpc client can add a mapping with:
-#   upnpc -a <internal-ip> <internal-port> <external-port> UDP [duration]
+#   upnpc [-u <root-desc-url>] -a <internal-ip> <internal-port> <external-port> UDP [duration]
 # We request duration 0 (permanent where supported) and also install a systemd
 # boot service + hourly timer because many home routers forget or expire UPnP
 # mappings despite accepting "permanent" leases.
 # ---------------------------------------------------------------------------
+valid_upnp_root_url() {
+    local url="${1:-}"
+    case "$url" in
+        http://*|https://*) ;;
+        *) return 1 ;;
+    esac
+    case "$url" in
+        *[[:space:]]*|*\"*) return 1 ;;
+    esac
+    return 0
+}
+
+upnp_args_for() {
+    local -n _out="$1"
+    _out=()
+    [ -n "${WAN:-}" ] && _out+=(-m "$WAN")
+    [ -n "${UPNP_ROOT_URL:-}" ] && _out+=(-u "$UPNP_ROOT_URL")
+}
+
+upnp_extract_root_url() {
+    awk '/^[[:space:]]*desc:[[:space:]]*/ { print $2; exit }'
+}
+
+upnp_discover_root_url() {
+    command -v upnpc >/dev/null 2>&1 || return 1
+    local _args=() _out="" _url=""
+    [ -n "${WAN:-}" ] && _args=(-m "$WAN")
+    _out=$(timeout 12s upnpc "${_args[@]}" -l 2>&1 || true)
+    _url=$(printf '%s\n' "$_out" | upnp_extract_root_url)
+    valid_upnp_root_url "$_url" || return 1
+    printf '%s' "$_url"
+}
+
+ensure_upnp_root_url() {
+    [ "${ENABLE_UPNP:-0}" = "1" ] || return 0
+    if [ -n "${UPNP_ROOT_URL:-}" ]; then
+        valid_upnp_root_url "$UPNP_ROOT_URL" || die "Invalid UPnP root URL: $UPNP_ROOT_URL"
+        return 0
+    fi
+
+    local _url=""
+    _url=$(upnp_discover_root_url || true)
+    if [ -n "$_url" ]; then
+        UPNP_ROOT_URL="$_url"
+        info "UPnP: discovered IGD root URL: $UPNP_ROOT_URL"
+        return 0
+    fi
+
+    if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
+        warn "UPnP: could not discover an IGD root URL; continuing with normal SSDP discovery."
+        return 0
+    fi
+
+    warn "UPnP discovery did not find an IGD. If your router's UPnP root description URL is known, enter it now."
+    while :; do
+        _url=$(ask_placeholder "UPnP root URL (leave empty to keep automatic discovery)" "$UPNP_ROOT_URL_EXAMPLE")
+        [ -n "$_url" ] || return 0
+        if valid_upnp_root_url "$_url"; then
+            UPNP_ROOT_URL="$_url"
+            return 0
+        fi
+        warn "Enter a URL like $UPNP_ROOT_URL_EXAMPLE, or press Enter to skip hard-coding it."
+    done
+}
+
 vpn_port_list() {
     local _seen_ports="" p
     for p in "$PORT" ${PORT_ALIASES//,/ }; do
@@ -1968,6 +2053,28 @@ SCRIPT_NAME="amnezia-installer"
 [ "${ENABLE_UPNP:-0}" = "1" ] || exit 0
 command -v upnpc >/dev/null 2>&1 || { echo "upnpc not found; install miniupnpc" >&2; exit 1; }
 
+valid_upnp_root_url() {
+    local url="${1:-}"
+    case "$url" in
+        http://*|https://*) ;;
+        *) return 1 ;;
+    esac
+    case "$url" in
+        *[[:space:]]*|*\"*) return 1 ;;
+    esac
+    return 0
+}
+
+upnp_args_for() {
+    local -n _out="$1"
+    _out=()
+    [ -n "${WAN:-}" ] && _out+=(-m "$WAN")
+    if [ -n "${UPNP_ROOT_URL:-}" ]; then
+        valid_upnp_root_url "$UPNP_ROOT_URL" || { echo "Invalid UPnP root URL: $UPNP_ROOT_URL" >&2; exit 1; }
+        _out+=(-u "$UPNP_ROOT_URL")
+    fi
+}
+
 vpn_port_list() {
     local _seen_ports="" p
     for p in "$PORT" ${PORT_ALIASES//,/ }; do
@@ -1994,8 +2101,7 @@ internal_ip4() {
 }
 
 ip4=$(internal_ip4) || { echo "Could not determine this server's LAN IPv4 address" >&2; exit 1; }
-upnpc_args=()
-[ -n "${WAN:-}" ] && upnpc_args=(-m "$WAN")
+upnp_args_for upnpc_args
 
 ok=0
 failed=0
@@ -2063,6 +2169,8 @@ apply_upnp_port_forwards() {
     }
     log "Configuring UPnP port forwarding for VPN UDP port(s): $(vpn_port_list | paste -sd, -)"
 
+    ensure_upnp_root_url
+
     local ip4
     ip4=$(upnp_internal_ip4 "$WAN") || {
         warn "UPnP: could not determine this server's LAN IPv4 address; skipping mappings."
@@ -2103,7 +2211,7 @@ remove_upnp_port_forwards() {
         while IFS= read -r _up; do
             [ -n "$_up" ] || continue
             local _upnp_args=()
-            [ -n "${WAN:-}" ] && _upnp_args=(-m "$WAN")
+            upnp_args_for _upnp_args
             upnpc "${_upnp_args[@]}" -d "$_up" UDP >/dev/null 2>&1 || true
         done < <(vpn_port_list)
     fi
@@ -2289,7 +2397,7 @@ status() {
         if command -v upnpc >/dev/null 2>&1; then
             info "UPnP router mappings:"
             local _upnp_args=()
-            [ -n "${WAN:-}" ] && _upnp_args=(-m "$WAN")
+            upnp_args_for _upnp_args
             upnpc "${_upnp_args[@]}" -l 2>/dev/null | sed -n '1,80p' || true
         fi
     else
@@ -2515,6 +2623,12 @@ do_install() {
             ;;
         *) die "AMNEZIA_ENABLE_UPNP must be 1/0, yes/no, or true/false." ;;
     esac
+    if [ "$ENABLE_UPNP" = "1" ] && [ -n "${AMNEZIA_UPNP_ROOT_URL:-}" ]; then
+        valid_upnp_root_url "$AMNEZIA_UPNP_ROOT_URL" \
+            || die "AMNEZIA_UPNP_ROOT_URL must look like $UPNP_ROOT_URL_EXAMPLE"
+        UPNP_ROOT_URL="$AMNEZIA_UPNP_ROOT_URL"
+        info "UPnP: using configured IGD root URL: $UPNP_ROOT_URL"
+    fi
 
     # ----- iptables management -----------------------------------------------
     # Detect iptables and decide whether to manage INPUT/FORWARD/DNAT rules.
@@ -2571,6 +2685,7 @@ do_install() {
         && _ipt_summary+=", DNAT ${PORT_ALIASES//,/ } → $PORT"
     local _upnp_summary="disabled"
     [ "$ENABLE_UPNP" = "1" ] && _upnp_summary="enabled for UDP $(vpn_port_list | paste -sd, -) via miniupnpc/upnpc"
+    [ "$ENABLE_UPNP" = "1" ] && [ -n "${UPNP_ROOT_URL:-}" ] && _upnp_summary+=" (root URL: $UPNP_ROOT_URL)"
     cat <<EOF
 
 ${C_BOLD}Installation summary${C_RST}
@@ -2590,6 +2705,9 @@ EOF
 
     # ---- do the work --------------------------------------------------------
     install_prereqs
+    if [ "$ENABLE_UPNP" = "1" ]; then
+        ensure_upnp_root_url
+    fi
     install_amneziawg
     configure_sysctl
     write_nft_hooks "$wan"
@@ -2628,7 +2746,7 @@ ${C_GRN}${C_BOLD}AmneziaWG server is up and all checks passed.${C_RST}
   Service       : ${SVC}  ($(systemctl is-active "$SVC"))
   Endpoint      : ${HOST}:${PORT}/udp
   Server pub    : ${SERVER_PUB}
-  UPnP         : $([ "${ENABLE_UPNP:-0}" = "1" ] && echo "enabled (timer: $(basename "$UPNP_TIMER"))" || echo disabled)
+  UPnP         : $([ "${ENABLE_UPNP:-0}" = "1" ] && echo "enabled (timer: $(basename "$UPNP_TIMER")$([ -n "${UPNP_ROOT_URL:-}" ] && printf ', root URL: %s' "$UPNP_ROOT_URL"))" || echo disabled)
   Local script  : ${INSTALLED_SELF}  (also at ${SYMLINK})
   Clients dir   : ${CLIENTS_DIR}
 
@@ -2737,6 +2855,7 @@ existing-install-detection prompt during reinstalls; AMNEZIA_NO_SHELL_DROP=1
 to skip the post-install 'cd into install dir' shell drop;
 AMNEZIA_MANAGE_IPTABLES=0 to skip all iptables rule management;
 AMNEZIA_ENABLE_UPNP=1 to install miniupnpc and keep router UPnP UDP forwards
+AMNEZIA_UPNP_ROOT_URL=http://192.168.1.1:5000/rootDesc.xml to bypass flaky UPnP discovery
 refreshed by systemd (default is disabled / prompted as "n").
 AMNEZIA_SECURE_BOOT_MOK=1 queues Ubuntu MOK enrollment when Secure Boot rejects
 the DKMS module; this still requires reboot-time MokManager confirmation.
