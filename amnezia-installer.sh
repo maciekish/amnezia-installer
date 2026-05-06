@@ -58,6 +58,9 @@
 #   AMNEZIA_MTU=1280
 #   AMNEZIA_MANAGE_IPTABLES=1|0  1 = add iptables INPUT/FORWARD/DNAT rules (default in
 #                                interactive and non-interactive); 0 = skip iptables entirely
+#   AMNEZIA_ENABLE_UPNP=1|0      1 = install miniupnpc and keep UPnP UDP forwards
+#                                for all VPN ports refreshed by a systemd timer
+#                                (default: 0 / prompted as "n")
 #   AMNEZIA_NO_UPDATE_CHECK=1    skip the on-startup self-update check
 #   AMNEZIA_FORCE_CLEANUP=1      auto-clean any existing AmneziaWG install before reinstalling
 #   AMNEZIA_NO_SHELL_DROP=1      do not exec $SHELL at /var/lib/amnezia-installer on completion
@@ -82,7 +85,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.4.1"
+readonly SCRIPT_VERSION="1.4.2"
 readonly SCRIPT_NAME="amnezia-installer"
 readonly IFACE="awg0"
 readonly SVC="awg-quick@${IFACE}.service"
@@ -95,6 +98,9 @@ readonly INSTALLED_SELF="${STATE_DIR}/${SCRIPT_NAME}.sh"
 readonly UPDATE_STAMP="${STATE_DIR}/.last-update-check"
 readonly SYMLINK="/usr/local/bin/${SCRIPT_NAME}"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-${SCRIPT_NAME}.conf"
+readonly UPNP_SCRIPT="${STATE_DIR}/upnp-refresh.sh"
+readonly UPNP_SERVICE="/etc/systemd/system/${SCRIPT_NAME}-upnp.service"
+readonly UPNP_TIMER="/etc/systemd/system/${SCRIPT_NAME}-upnp.timer"
 readonly HOOK_UP="${AWG_DIR}/${IFACE}.up.sh"
 readonly HOOK_DOWN="${AWG_DIR}/${IFACE}.down.sh"
 readonly NFT_T_FWD="amnezia_fwd"
@@ -388,6 +394,8 @@ detect_existing_awg() {
 
     [ -e "$AWG_CONF" ]                   && found+=("config file $AWG_CONF")
     [ -e "$HOOK_UP" ] || [ -e "$HOOK_DOWN" ] && found+=("hook scripts in $AWG_DIR")
+    [ -e "$UPNP_SCRIPT" ] || [ -e "$UPNP_SERVICE" ] || [ -e "$UPNP_TIMER" ] \
+        && found+=("UPnP refresh service/timer")
     ip link show "$IFACE" >/dev/null 2>&1 && found+=("interface '$IFACE' is up")
     [ -e "$SYSCTL_FILE" ]                && found+=("sysctl drop-in $SYSCTL_FILE")
     [ -e "$META_FILE" ]                  && found+=("state file $META_FILE")
@@ -420,6 +428,7 @@ cleanup_existing_awg() {
     nft delete table ip   "$NFT_T_NAT4" 2>/dev/null || true
     nft delete table ip6  "$NFT_T_NAT6" 2>/dev/null || true
 
+    remove_upnp_port_forwards
     remove_iptables_rules
 
     if ip link show "$IFACE" >/dev/null 2>&1; then
@@ -432,6 +441,10 @@ cleanup_existing_awg() {
 
     rm -f "$SYSCTL_FILE"
     sysctl --system >/dev/null 2>&1 || true
+
+    log "Removing UPnP refresh units..."
+    rm -f "$UPNP_SCRIPT" "$UPNP_SERVICE" "$UPNP_TIMER"
+    systemctl daemon-reload 2>/dev/null || true
 
     rm -f "$HOOK_UP" "$HOOK_DOWN" "$AWG_CONF"
     rm -f "$AWG_DIR/server.key" "$AWG_DIR/server.pub"
@@ -615,13 +628,22 @@ install_prereqs() {
         apt-get install -y -qq \
             curl ca-certificates iproute2 nftables qrencode \
             software-properties-common gpg jq
+        if [ "${ENABLE_UPNP:-0}" = "1" ]; then
+            apt-get install -y -qq miniupnpc
+        fi
     elif is_rhel_like; then
         local pm
         pm=$(command -v dnf || command -v yum)
         "$pm" install -y curl ca-certificates iproute nftables qrencode jq \
             'dnf-command(copr)' || "$pm" install -y curl iproute nftables qrencode jq
+        if [ "${ENABLE_UPNP:-0}" = "1" ]; then
+            "$pm" install -y miniupnpc
+        fi
     elif is_arch_like; then
         pacman -Sy --noconfirm --needed curl ca-certificates iproute2 nftables qrencode jq
+        if [ "${ENABLE_UPNP:-0}" = "1" ]; then
+            pacman -Sy --noconfirm --needed miniupnpc
+        fi
     else
         die "Unsupported distro: $OS_ID. Patches welcome."
     fi
@@ -923,6 +945,7 @@ H2="$H2"
 H3="$H3"
 H4="$H4"
 MANAGE_IPTABLES="${MANAGE_IPTABLES:-0}"
+ENABLE_UPNP="${ENABLE_UPNP:-0}"
 EOF
     chmod 600 "$META_FILE"
 }
@@ -1269,7 +1292,7 @@ do_doctor() {
     local HOST="" PORT="" PORT_ALIASES="" WAN="" NET4="" NET6="" NET4_PREFIX="" NET6_PREFIX=""
     local SERVER_IP4="" SERVER_IP6="" DNS="" MTU="" ENABLE_IPV6="0"
     local OBFUSCATION="off" JC=0 JMIN=0 JMAX=0 S1=0 S2=0 H1=1 H2=2 H3=3 H4=4
-    local MANAGE_IPTABLES="0"
+    local MANAGE_IPTABLES="0" ENABLE_UPNP="0"
     if [ -r "$META_FILE" ]; then
         # shellcheck disable=SC1090
         . "$META_FILE" 2>/dev/null || true
@@ -1511,6 +1534,24 @@ do_doctor() {
         fi
     fi
 
+    # ── 13c. UPnP router port mappings ───────────────────────────────────────
+    if [ "${ENABLE_UPNP:-0}" = "1" ]; then
+        if ! command -v upnpc >/dev/null 2>&1; then
+            _doc_fail_line "UPnP" "enabled, but upnpc is missing (install miniupnpc)"
+            _errs=$((_errs+1))
+        elif ! systemctl is-enabled --quiet "$(basename "$UPNP_TIMER")" 2>/dev/null; then
+            _doc_warn_line "UPnP" "refresh timer is not enabled"
+            _doc_hint "Fix: systemctl enable --now $(basename "$UPNP_TIMER")"
+            _warns=$((_warns+1))
+        elif systemctl is-failed --quiet "$(basename "$UPNP_SERVICE")" 2>/dev/null; then
+            _doc_warn_line "UPnP" "last refresh failed; router may not support UPnP IGD"
+            _doc_hint "Inspect: journalctl -u $(basename "$UPNP_SERVICE") -n 40 --no-pager"
+            _warns=$((_warns+1))
+        else
+            _doc_pass "UPnP" "refresh timer enabled for UDP $(vpn_port_list | paste -sd, -)"
+        fi
+    fi
+
     # ── 14. ufw ───────────────────────────────────────────────────────────────
     if command -v ufw >/dev/null 2>&1; then
         local _ufw_st; _ufw_st=$(ufw status 2>/dev/null | head -1 || echo "unknown")
@@ -1586,6 +1627,195 @@ do_doctor() {
         printf '%s%s[ OK ] Doctor: all checks passed. VPN should be functional.%s\n' \
             "$C_GRN" "$C_BOLD" "$C_RST"
         return 0
+    fi
+}
+
+
+# ---------------------------------------------------------------------------
+# UPnP port forwarding lifecycle. Ubuntu ships the miniupnpc package, whose
+# upnpc client can add a mapping with:
+#   upnpc -a <internal-ip> <internal-port> <external-port> UDP [duration]
+# We request duration 0 (permanent where supported) and also install a systemd
+# boot service + hourly timer because many home routers forget or expire UPnP
+# mappings despite accepting "permanent" leases.
+# ---------------------------------------------------------------------------
+vpn_port_list() {
+    local _seen_ports="" p
+    for p in "$PORT" ${PORT_ALIASES//,/ }; do
+        p="${p// /}"
+        [ -z "$p" ] && continue
+        case " $_seen_ports " in *" $p "*) continue ;; esac
+        _seen_ports+=" $p"
+        printf '%s\n' "$p"
+    done
+}
+
+upnp_internal_ip4() {
+    local wan="${1:-${WAN:-}}" ip=""
+    if [ -n "$wan" ]; then
+        ip=$(ip -4 -o addr show dev "$wan" scope global 2>/dev/null \
+            | awk '{sub(/\/.*/, "", $4); print $4; exit}' || true)
+    fi
+    if [ -z "$ip" ]; then
+        ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
+            | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}' || true)
+    fi
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    printf '%s' "$ip"
+}
+
+write_upnp_refresh_script() {
+    [ "${ENABLE_UPNP:-0}" = "1" ] || return 0
+    install -d -m 0700 "$STATE_DIR"
+    cat >"$UPNP_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+META_FILE="/var/lib/amnezia-installer/server.env"
+SCRIPT_NAME="amnezia-installer"
+[ -r "$META_FILE" ] || { echo "Missing $META_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$META_FILE"
+[ "${ENABLE_UPNP:-0}" = "1" ] || exit 0
+command -v upnpc >/dev/null 2>&1 || { echo "upnpc not found; install miniupnpc" >&2; exit 1; }
+
+vpn_port_list() {
+    local _seen_ports="" p
+    for p in "$PORT" ${PORT_ALIASES//,/ }; do
+        p="${p// /}"
+        [ -z "$p" ] && continue
+        case " $_seen_ports " in *" $p "*) continue ;; esac
+        _seen_ports+=" $p"
+        printf '%s\n' "$p"
+    done
+}
+
+internal_ip4() {
+    local ip=""
+    if [ -n "${WAN:-}" ]; then
+        ip=$(ip -4 -o addr show dev "$WAN" scope global 2>/dev/null \
+            | awk '{sub(/\/.*/, "", $4); print $4; exit}' || true)
+    fi
+    if [ -z "$ip" ]; then
+        ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
+            | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}' || true)
+    fi
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    printf '%s' "$ip"
+}
+
+ip4=$(internal_ip4) || { echo "Could not determine this server's LAN IPv4 address" >&2; exit 1; }
+upnpc_args=()
+[ -n "${WAN:-}" ] && upnpc_args=(-m "$WAN")
+
+ok=0
+failed=0
+while IFS= read -r port; do
+    [ -n "$port" ] || continue
+    desc="${SCRIPT_NAME} awg0 UDP ${port}"
+    if upnpc "${upnpc_args[@]}" -e "$desc" -a "$ip4" "$port" "$port" UDP 0; then
+        echo "UPnP mapped UDP ${port} -> ${ip4}:${port}"
+        ok=$((ok + 1))
+    else
+        echo "UPnP failed for UDP ${port}" >&2
+        failed=$((failed + 1))
+    fi
+done < <(vpn_port_list)
+
+if [ "$ok" -gt 0 ] && [ "$failed" -gt 0 ]; then
+    echo "UPnP partially refreshed: ${ok} port(s) mapped, ${failed} port(s) failed" >&2
+    exit 2
+elif [ "$ok" -gt 0 ]; then
+    echo "UPnP refreshed: ${ok} port(s) mapped"
+    exit 0
+else
+    echo "UPnP refresh failed: no ports were mapped" >&2
+    exit 1
+fi
+EOF
+    chmod 0700 "$UPNP_SCRIPT"
+}
+
+write_upnp_systemd_units() {
+    [ "${ENABLE_UPNP:-0}" = "1" ] || return 0
+    cat >"$UPNP_SERVICE" <<EOF
+[Unit]
+Description=Refresh AmneziaWG UPnP port mappings
+Documentation=https://manpages.ubuntu.com/manpages/jammy/man1/upnpc.1.html
+Wants=network-online.target
+After=network-online.target ${SVC}
+
+[Service]
+Type=oneshot
+ExecStart=${UPNP_SCRIPT}
+SuccessExitStatus=2
+EOF
+
+    cat >"$UPNP_TIMER" <<EOF
+[Unit]
+Description=Periodically refresh AmneziaWG UPnP port mappings
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=1h
+Unit=$(basename "$UPNP_SERVICE")
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+apply_upnp_port_forwards() {
+    [ "${ENABLE_UPNP:-0}" = "1" ] || return 0
+    command -v upnpc >/dev/null 2>&1 || {
+        warn "UPnP requested, but upnpc is missing (package: miniupnpc)."
+        return 1
+    }
+    log "Configuring UPnP port forwarding for VPN UDP port(s): $(vpn_port_list | paste -sd, -)"
+
+    local ip4
+    ip4=$(upnp_internal_ip4 "$WAN") || {
+        warn "UPnP: could not determine this server's LAN IPv4 address; skipping mappings."
+        return 1
+    }
+
+    write_upnp_refresh_script
+    write_upnp_systemd_units
+    systemctl daemon-reload
+    systemctl enable --now "$(basename "$UPNP_TIMER")" >/dev/null 2>&1 \
+        || warn "UPnP: failed to enable refresh timer; mappings may not survive reboot."
+
+    local _upnp_rc=0
+    "$UPNP_SCRIPT" || _upnp_rc=$?
+    case "$_upnp_rc" in
+        0)
+            log "UPnP mappings are active and will be refreshed hourly."
+            ;;
+        2)
+            warn "UPnP partially succeeded. Successful ports are active and will be refreshed hourly."
+            return 0
+            ;;
+        *)
+            warn "UPnP mapping failed. Ensure your router supports UPnP IGD and has UPnP enabled."
+            return 1
+            ;;
+    esac
+}
+
+remove_upnp_port_forwards() {
+    [ "${ENABLE_UPNP:-0}" = "1" ] || [ -e "$UPNP_SERVICE" ] || [ -e "$UPNP_TIMER" ] || return 0
+    log "Removing UPnP port forwarding refresh service and mappings..."
+    systemctl disable --now "$(basename "$UPNP_TIMER")" >/dev/null 2>&1 || true
+    systemctl stop "$(basename "$UPNP_SERVICE")" >/dev/null 2>&1 || true
+
+    if [ "${ENABLE_UPNP:-0}" = "1" ] && command -v upnpc >/dev/null 2>&1 && [ -n "${PORT:-}" ]; then
+        local _up
+        while IFS= read -r _up; do
+            [ -n "$_up" ] || continue
+            local _upnp_args=()
+            [ -n "${WAN:-}" ] && _upnp_args=(-m "$WAN")
+            upnpc "${_upnp_args[@]}" -d "$_up" UDP >/dev/null 2>&1 || true
+        done < <(vpn_port_list)
     fi
 }
 
@@ -1762,6 +1992,19 @@ status() {
     echo
     info "nftables tables (amnezia_*):"
     nft list tables 2>/dev/null | grep -E 'amnezia_' || info "(none loaded)"
+    echo
+    if [ "${ENABLE_UPNP:-0}" = "1" ]; then
+        info "UPnP refresh timer:"
+        systemctl --no-pager --full status "$(basename "$UPNP_TIMER")" 2>/dev/null | sed -n '1,8p' || true
+        if command -v upnpc >/dev/null 2>&1; then
+            info "UPnP router mappings:"
+            local _upnp_args=()
+            [ -n "${WAN:-}" ] && _upnp_args=(-m "$WAN")
+            upnpc "${_upnp_args[@]}" -l 2>/dev/null | sed -n '1,80p' || true
+        fi
+    else
+        info "UPnP forwarding: disabled"
+    fi
 }
 
 uninstall() {
@@ -1780,6 +2023,7 @@ uninstall() {
     nft delete table ip   "$NFT_T_NAT4" 2>/dev/null || true
     nft delete table ip6  "$NFT_T_NAT6" 2>/dev/null || true
 
+    remove_upnp_port_forwards
     remove_iptables_rules
 
     log "Removing sysctl drop-in..."
@@ -1788,6 +2032,10 @@ uninstall() {
 
     log "Removing hook scripts..."
     rm -f "$HOOK_UP" "$HOOK_DOWN"
+
+    log "Removing UPnP refresh units..."
+    rm -f "$UPNP_SCRIPT" "$UPNP_SERVICE" "$UPNP_TIMER"
+    systemctl daemon-reload 2>/dev/null || true
 
     if [ "$purge" -eq 1 ]; then
         warn "Purging $AWG_DIR and $STATE_DIR (all keys + client configs)..."
@@ -1953,6 +2201,31 @@ do_install() {
     # Export WAN to global so save_meta and apply_iptables_rules can use it.
     WAN="$wan"
 
+    # ----- UPnP port forwarding -----------------------------------------------
+    # Optional because UPnP exposes ports on the edge router and many operators
+    # prefer explicit router/cloud-firewall rules. Default is intentionally "n".
+    ENABLE_UPNP=0
+    case "${AMNEZIA_ENABLE_UPNP:-}" in
+        1|y|Y|yes|YES|true|TRUE)
+            ENABLE_UPNP=1
+            info "UPnP: miniupnpc/upnpc will forward all VPN UDP ports."
+            ;;
+        0|n|N|no|NO|false|FALSE)
+            ENABLE_UPNP=0
+            ;;
+        "")
+            if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
+                ENABLE_UPNP=0
+            else
+                warn "UPnP can automatically open ports on your router; enable it only on a trusted LAN/router."
+                if ask_yn "Forward VPN UDP port(s) on your router with UPnP?" "n"; then
+                    ENABLE_UPNP=1
+                fi
+            fi
+            ;;
+        *) die "AMNEZIA_ENABLE_UPNP must be 1/0, yes/no, or true/false." ;;
+    esac
+
     # ----- iptables management -----------------------------------------------
     # Detect iptables and decide whether to manage INPUT/FORWARD/DNAT rules.
     MANAGE_IPTABLES=0
@@ -2006,6 +2279,8 @@ do_install() {
     [ "$MANAGE_IPTABLES" = "1" ] && _ipt_summary="INPUT :$PORT, FORWARD $IFACE↔$wan"
     [ "$MANAGE_IPTABLES" = "1" ] && [ -n "$PORT_ALIASES" ] \
         && _ipt_summary+=", DNAT ${PORT_ALIASES//,/ } → $PORT"
+    local _upnp_summary="disabled"
+    [ "$ENABLE_UPNP" = "1" ] && _upnp_summary="enabled for UDP $(vpn_port_list | paste -sd, -) via miniupnpc/upnpc"
     cat <<EOF
 
 ${C_BOLD}Installation summary${C_RST}
@@ -2017,6 +2292,7 @@ ${C_BOLD}Installation summary${C_RST}
   MTU             : ${MTU}
   Obfuscation     : ${OBFUSCATION}$([ "$OBFUSCATION" != "off" ] && printf ' (Jc=%s Jmin=%s Jmax=%s S1=%s S2=%s)' "$JC" "$JMIN" "$JMAX" "$S1" "$S2")
   iptables rules  : ${_ipt_summary}
+  UPnP forwarding : ${_upnp_summary}
   Initial clients : ${CLIENTS_CSV}
 
 EOF
@@ -2037,7 +2313,8 @@ EOF
     systemctl is-active --quiet "$SVC" \
         || die "$SVC failed to start. Inspect: journalctl -u $SVC -n 40 --no-pager"
 
-    # ---- iptables rules (INPUT, FORWARD, DNAT aliases) ---------------------
+    # ---- UPnP router mappings + iptables rules -----------------------------
+    apply_upnp_port_forwards || true
     apply_iptables_rules
 
     # ---- initial client roster ---------------------------------------------
@@ -2061,6 +2338,7 @@ ${C_GRN}${C_BOLD}AmneziaWG server is up and all checks passed.${C_RST}
   Service       : ${SVC}  ($(systemctl is-active "$SVC"))
   Endpoint      : ${HOST}:${PORT}/udp
   Server pub    : ${SERVER_PUB}
+  UPnP         : $([ "${ENABLE_UPNP:-0}" = "1" ] && echo "enabled (timer: $(basename "$UPNP_TIMER"))" || echo disabled)
   Local script  : ${INSTALLED_SELF}  (also at ${SYMLINK})
   Clients dir   : ${CLIENTS_DIR}
 
@@ -2166,7 +2444,9 @@ The script auto-checks for updates against the URL above (cached for 24 h).
 Set AMNEZIA_NO_UPDATE_CHECK=1 to suppress; AMNEZIA_FORCE_CLEANUP=1 to skip the
 existing-install-detection prompt during reinstalls; AMNEZIA_NO_SHELL_DROP=1
 to skip the post-install 'cd into install dir' shell drop;
-AMNEZIA_MANAGE_IPTABLES=0 to skip all iptables rule management.
+AMNEZIA_MANAGE_IPTABLES=0 to skip all iptables rule management;
+AMNEZIA_ENABLE_UPNP=1 to install miniupnpc and keep router UPnP UDP forwards
+refreshed by systemd (default is disabled / prompted as "n").
 
 See the comment header at the top of this script for non-interactive env vars.
 EOF
