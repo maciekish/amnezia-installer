@@ -64,6 +64,8 @@
 #   AMNEZIA_NO_UPDATE_CHECK=1    skip the on-startup self-update check
 #   AMNEZIA_FORCE_CLEANUP=1      auto-clean any existing AmneziaWG install before reinstalling
 #   AMNEZIA_NO_SHELL_DROP=1      do not exec $SHELL at /var/lib/amnezia-installer on completion
+#   AMNEZIA_SECURE_BOOT_MOK=1|0  1 = queue Ubuntu MOK enrollment when Secure Boot rejects
+#                                the DKMS module; requires reboot + boot console.
 #
 # Client config files are saved as <host>-<clientname>.conf (e.g.
 # "vpn.example.com-maciej.conf") so a bulk import into the AmneziaVPN client
@@ -85,7 +87,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.4.2"
+readonly SCRIPT_VERSION="1.4.5"
 readonly SCRIPT_NAME="amnezia-installer"
 readonly IFACE="awg0"
 readonly SVC="awg-quick@${IFACE}.service"
@@ -108,6 +110,9 @@ readonly NFT_T_NAT4="amnezia_nat4"
 readonly NFT_T_NAT6="amnezia_nat6"
 readonly UPDATE_URL="https://raw.githubusercontent.com/maciekish/amnezia-installer/main/amnezia-installer.sh"
 readonly UPDATE_CACHE_SECONDS=86400  # only hit the network once a day
+readonly UBUNTU_MOK_DIR="/var/lib/shim-signed/mok"
+readonly UBUNTU_MOK_DER="${UBUNTU_MOK_DIR}/MOK.der"
+readonly UBUNTU_MOK_PRIV="${UBUNTU_MOK_DIR}/MOK.priv"
 
 # ---------------------------------------------------------------------------
 # Logging / UX helpers
@@ -713,14 +718,127 @@ install_debian_kernel_build_prereqs() {
     apt-get install -y -qq "${packages[@]}"
 }
 
+secure_boot_state() {
+    if command -v mokutil >/dev/null 2>&1; then
+        mokutil --sb-state 2>/dev/null | head -n1 || true
+        return 0
+    fi
+
+    local sbvar bytes value
+    sbvar=$(find /sys/firmware/efi/efivars -maxdepth 1 -name 'SecureBoot-*' -print -quit 2>/dev/null || true)
+    [ -r "$sbvar" ] || return 0
+
+    # efivarfs prepends four attribute bytes; the fifth byte is the SecureBoot
+    # value (1 = enabled, 0 = disabled). This is a fallback for minimal servers
+    # where mokutil is not installed.
+    bytes=$(od -An -t u1 -N5 "$sbvar" 2>/dev/null || true)
+    value=$(printf '%s\n' "$bytes" | awk '{print $5; exit}')
+    case "$value" in
+        1) printf '%s\n' "SecureBoot enabled (from efivarfs)" ;;
+        0) printf '%s\n' "SecureBoot disabled (from efivarfs)" ;;
+    esac
+}
+
+modprobe_key_rejected() {
+    case "${1:-}" in
+        *"Key was rejected"*|*"Required key not available"*) return 0 ;;
+    esac
+    return 1
+}
+
+prepare_secure_boot_mok_enrollment() {
+    is_debian_like || { warn "Automatic MOK preparation is currently implemented only for Debian/Ubuntu systems."; return 1; }
+
+    log "Preparing Ubuntu MOK enrollment for Secure Boot module loading..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mokutil shim-signed dkms kmod \
+        || { warn "Could not install mokutil/shim-signed; cannot queue MOK enrollment automatically."; return 1; }
+
+    if ! command -v update-secureboot-policy >/dev/null 2>&1; then
+        warn "update-secureboot-policy is unavailable; cannot create/enroll Ubuntu's DKMS MOK automatically."
+        return 1
+    fi
+
+    if [ ! -r "$UBUNTU_MOK_DER" ] || [ ! -r "$UBUNTU_MOK_PRIV" ]; then
+        info "No Ubuntu DKMS MOK found at $UBUNTU_MOK_DIR; generating one."
+        update-secureboot-policy --new-key \
+            || { warn "Could not generate Ubuntu DKMS MOK keypair."; return 1; }
+    fi
+
+    # Re-run DKMS now that the Ubuntu MOK exists so the installed module is
+    # signed with the key the user will enroll on next boot. This is harmless
+    # if DKMS has already signed it with the same key.
+    if command -v dkms >/dev/null 2>&1; then
+        info "Re-running DKMS autoinstall for $(running_kernel) so modules are signed with the Ubuntu MOK."
+        dkms autoinstall -k "$(running_kernel)" || warn "DKMS autoinstall reported an error; check 'dkms status' and /var/lib/dkms logs."
+    fi
+
+    if mokutil --test-key "$UBUNTU_MOK_DER" >/dev/null 2>&1; then
+        info "Ubuntu DKMS MOK is already enrolled; retrying modprobe may succeed after DKMS signing completes."
+        return 0
+    fi
+
+    warn "A trusted key cannot be added to Secure Boot from the running OS alone."
+    warn "This command can only queue enrollment; shim/MokManager must confirm it during the next boot."
+    warn "You do NOT need BIOS setup, but you do need boot-console access (cloud serial/VNC/IPMI/hosting rescue console)."
+    warn "When prompted now, choose a one-time password; after reboot pick: Enroll MOK -> Continue -> Yes -> enter that password -> Reboot."
+
+    if ! update-secureboot-policy --enroll-key; then
+        warn "Ubuntu enrollment helper failed; falling back to direct mokutil import."
+        mokutil --import "$UBUNTU_MOK_DER" || { warn "Could not queue MOK enrollment."; return 1; }
+    fi
+
+    warn "MOK enrollment is queued. Reboot and complete MokManager to make the kernel trust DKMS-signed modules."
+    return 0
+}
+
+maybe_prepare_secure_boot_fix() {
+    local modprobe_hint="${1:-}"
+    modprobe_key_rejected "$modprobe_hint" || return 0
+
+    case "${AMNEZIA_SECURE_BOOT_MOK:-auto}" in
+        1|yes|true|enroll)
+            prepare_secure_boot_mok_enrollment || true
+            ;;
+        0|no|false|skip)
+            warn "Secure Boot MOK enrollment skipped (AMNEZIA_SECURE_BOOT_MOK=0)."
+            ;;
+        auto|"")
+            if [ "${AMNEZIA_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
+                warn "Set AMNEZIA_SECURE_BOOT_MOK=1 and run from a TTY to queue MOK enrollment for the kernel module."
+            elif ask_yn "Queue Ubuntu MOK enrollment to fix Secure Boot module rejection on next reboot?" "y"; then
+                prepare_secure_boot_mok_enrollment || true
+            else
+                warn "MOK enrollment skipped; using userspace fallback for this install."
+            fi
+            ;;
+        *)
+            warn "Unknown AMNEZIA_SECURE_BOOT_MOK value '${AMNEZIA_SECURE_BOOT_MOK}'; expected 1/0/auto."
+            ;;
+    esac
+}
+
 print_amneziawg_runtime_diagnostics() {
-    local kernel latest headers_pkg dkms_lines
+    local kernel latest headers_pkg dkms_lines modprobe_hint="${1:-}"
     kernel=$(running_kernel)
     latest=$(latest_installed_kernel || true)
     headers_pkg="linux-headers-${kernel}"
 
     err "AmneziaWG runtime is unavailable for the running kernel ($kernel)."
     err "The service cannot create '$IFACE' because 'ip link add $IFACE type amneziawg' is unsupported."
+    if [ -n "$modprobe_hint" ]; then
+        warn "modprobe amneziawg failed with: $modprobe_hint"
+        case "$modprobe_hint" in
+            *"Key was rejected"*|*"Required key not available"*)
+                local sb_state
+                sb_state=$(secure_boot_state || true)
+                [ -n "$sb_state" ] && warn "Secure Boot state: $sb_state"
+                warn "The DKMS module exists, but the kernel rejected its signature/key."
+                warn "With Secure Boot enabled, enroll the DKMS/MOK signing key or disable Secure Boot to load the kernel module."
+                warn "The installer will use amneziawg-go instead because it does not require loading an out-of-tree kernel module."
+                ;;
+        esac
+    fi
 
     if [ -n "$latest" ] && [ "$latest" != "$kernel" ]; then
         warn "A different kernel appears installed: $latest. Reboot into it, then rerun this installer."
@@ -756,6 +874,54 @@ amneziawg_userspace_available() {
     command -v "${WG_QUICK_USERSPACE_IMPLEMENTATION:-amneziawg-go}" >/dev/null 2>&1
 }
 
+build_amneziawg_go_from_source() {
+    local src="/usr/local/src/amneziawg" go_repo
+    go_repo="https://github.com/amnezia-vpn/amneziawg-go.git"
+
+    warn "Building amneziawg-go userspace fallback from source."
+    if is_debian_like; then
+        apt-get install -y -qq build-essential git golang-go iproute2
+    elif is_rhel_like; then
+        local pm; pm=$(command -v dnf || command -v yum)
+        "$pm" install -y @development-tools git golang iproute
+    elif is_arch_like; then
+        pacman -Sy --noconfirm --needed base-devel git go
+    fi
+
+    install -d -m 0755 "$src"
+    if [ ! -d "$src/amneziawg-go" ]; then
+        git -C "$src" clone --depth=1 "$go_repo"
+    else
+        git -C "$src/amneziawg-go" pull --ff-only || true
+    fi
+    ( cd "$src/amneziawg-go" && go build -o /usr/local/bin/amneziawg-go . )
+    ln -sf /usr/local/bin/amneziawg-go /usr/bin/amneziawg-go
+}
+
+install_amneziawg_userspace_fallback() {
+    amneziawg_userspace_available && return 0
+
+    warn "Installing amneziawg-go userspace fallback."
+    if is_debian_like; then
+        if apt_pkg_available amneziawg-go; then
+            apt-get install -y -qq amneziawg-go amneziawg-tools \
+                || build_amneziawg_go_from_source
+        else
+            build_amneziawg_go_from_source
+        fi
+    elif is_rhel_like; then
+        local pm; pm=$(command -v dnf || command -v yum)
+        "$pm" install -y amneziawg-go 2>/dev/null || build_amneziawg_go_from_source
+    elif is_arch_like; then
+        pacman -Sy --noconfirm --needed amneziawg-go 2>/dev/null || build_amneziawg_go_from_source
+    else
+        build_amneziawg_go_from_source
+    fi
+
+    amneziawg_userspace_available \
+        || die "Could not install amneziawg-go userspace fallback."
+}
+
 ensure_amneziawg_runtime() {
     log "Checking AmneziaWG runtime support..."
 
@@ -764,9 +930,13 @@ ensure_amneziawg_runtime() {
         return 0
     fi
 
-    if command -v modprobe >/dev/null 2>&1 && modprobe amneziawg >/dev/null 2>&1; then
-        info "Loaded AmneziaWG kernel module for $(running_kernel)."
-        return 0
+    local modprobe_out=""
+    if command -v modprobe >/dev/null 2>&1; then
+        if modprobe_out=$(modprobe amneziawg 2>&1); then
+            info "Loaded AmneziaWG kernel module for $(running_kernel)."
+            return 0
+        fi
+        modprobe_out=$(printf '%s' "$modprobe_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
     fi
 
     if amneziawg_userspace_available; then
@@ -774,8 +944,11 @@ ensure_amneziawg_runtime() {
         return 0
     fi
 
-    print_amneziawg_runtime_diagnostics
-    die "Install cannot continue until the AmneziaWG kernel module can load (or amneziawg-go is installed)."
+    print_amneziawg_runtime_diagnostics "$modprobe_out"
+    maybe_prepare_secure_boot_fix "$modprobe_out"
+    install_amneziawg_userspace_fallback
+
+    warn "Continuing with ${WG_QUICK_USERSPACE_IMPLEMENTATION:-amneziawg-go}; the DKMS kernel module is not required."
 }
 
 install_amneziawg_apt() {
@@ -817,14 +990,7 @@ EOF
     tail -n 40 "$apt_log" >&2 || true
     rm -f "$apt_log"
 
-    if apt_pkg_available amneziawg-go; then
-        warn "Installing userspace amneziawg-go fallback."
-        apt-get install -y -qq amneziawg-go amneziawg-tools \
-            || die "Could not install amneziawg-go fallback from the PPA."
-    else
-        print_amneziawg_runtime_diagnostics
-        die "Could not install AmneziaWG packages from the PPA."
-    fi
+    install_amneziawg_userspace_fallback
 }
 
 install_amneziawg_dnf() {
@@ -859,9 +1025,8 @@ install_amneziawg_arch() {
 }
 
 build_from_source() {
-    local src="/usr/local/src/amneziawg" tools_repo go_repo
+    local src="/usr/local/src/amneziawg" tools_repo
     tools_repo="https://github.com/amnezia-vpn/amneziawg-tools.git"
-    go_repo="https://github.com/amnezia-vpn/amneziawg-go.git"
 
     if is_debian_like; then
         apt-get install -y -qq build-essential git make pkg-config libmnl-dev \
@@ -886,13 +1051,7 @@ build_from_source() {
         WITH_BASHCOMPLETION=yes WITH_WGQUICK=yes WITH_SYSTEMDUNITS=yes
 
     # amneziawg-go (userspace implementation, picks up automatically when no kmod)
-    if [ ! -d "$src/amneziawg-go" ]; then
-        git -C "$src" clone --depth=1 "$go_repo"
-    else
-        git -C "$src/amneziawg-go" pull --ff-only || true
-    fi
-    ( cd "$src/amneziawg-go" && go build -o /usr/local/bin/amneziawg-go . )
-    ln -sf /usr/local/bin/amneziawg-go /usr/bin/amneziawg-go
+    build_amneziawg_go_from_source
 }
 
 # ---------------------------------------------------------------------------
@@ -2563,6 +2722,7 @@ Usage:
   sudo $0 show-client   <name>
   sudo $0 status
   sudo $0 doctor                     # check service, port, firewall, sysctl, nftables, etc.
+  sudo $0 secure-boot-fix            # queue Ubuntu MOK enrollment for DKMS modules
   sudo $0 self-update [--force]      # force a network check + re-exec
   sudo $0 version
   sudo $0 uninstall [--purge]
@@ -2578,6 +2738,8 @@ to skip the post-install 'cd into install dir' shell drop;
 AMNEZIA_MANAGE_IPTABLES=0 to skip all iptables rule management;
 AMNEZIA_ENABLE_UPNP=1 to install miniupnpc and keep router UPnP UDP forwards
 refreshed by systemd (default is disabled / prompted as "n").
+AMNEZIA_SECURE_BOOT_MOK=1 queues Ubuntu MOK enrollment when Secure Boot rejects
+the DKMS module; this still requires reboot-time MokManager confirmation.
 
 See the comment header at the top of this script for non-interactive env vars.
 EOF
@@ -2639,6 +2801,10 @@ main() {
         doctor)
             need_root
             _rc=0; do_doctor || _rc=$?; exit "$_rc"
+            ;;
+        secure-boot-fix)
+            need_root
+            prepare_secure_boot_mok_enrollment
             ;;
         uninstall)
             need_root; shift; uninstall "${1:-}"
