@@ -77,7 +77,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.2.1"
+readonly SCRIPT_VERSION="1.2.2"
 readonly SCRIPT_NAME="amnezia-installer"
 readonly IFACE="awg0"
 readonly SVC="awg-quick@${IFACE}.service"
@@ -760,6 +760,8 @@ configure_sysctl() {
 write_nft_hooks() {
     local wan="$1"
     log "Writing nftables hook scripts (WAN iface: $wan)..."
+
+    install -d -m 700 "$AWG_DIR"
 
     cat >"$HOOK_UP" <<EOF
 #!/usr/bin/env bash
